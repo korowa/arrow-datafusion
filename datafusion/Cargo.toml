@@ -50,6 +50,7 @@ force_hash_collisions = []
 avro = ["avro-rs", "num-traits"]
 
 [dependencies]
+datafusion-common = { path = "../datafusion-common" }
 ahash = { version = "0.7", default-features = false }
 hashbrown = { version = "0.12", features = ["raw"] }
 arrow = { version = "8.0.0", features = ["prettyprint"] }
