@@ -468,8 +468,15 @@ fn read_partition(
         }
 
         let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
-        let adapted_projections =
-            schema_adapter.map_projections(&arrow_reader.get_schema()?, projection)?;
+        let adapted_projections = match schema_adapter
+            .map_projections(&arrow_reader.get_schema()?, projection)
+        {
+            Ok(projections) => projections,
+            Err(err) => {
+                send_result(&response_tx, Err(ArrowError::SchemaError(err.to_string())))?;
+                return Err(err);
+            }
+        };
 
         let mut batch_reader =
             arrow_reader.get_record_reader_by_columns(adapted_projections, batch_size)?;
@@ -777,6 +784,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic(
+        expected = "Failed to map column projection for field c3. Incompatible data types Float32 and Int8"
+    )]
     async fn evolved_schema_incompatible_types() {
         let c1: ArrayRef =
             Arc::new(StringArray::from(vec![Some("Foo"), None, Some("bar")]));
@@ -805,21 +815,7 @@ mod tests {
         ]);
 
         // read/write them files:
-        let read =
-            round_trip_to_parquet(vec![batch1, batch2], None, Some(Arc::new(schema)))
-                .await;
-
-        // expect only the first batch to be read
-        let expected = vec![
-            "+-----+----+----+",
-            "| c1  | c2 | c3 |",
-            "+-----+----+----+",
-            "| Foo | 1  | 10 |",
-            "|     | 2  | 20 |",
-            "| bar |    |    |",
-            "+-----+----+----+",
-        ];
-        assert_batches_sorted_eq!(expected, &read);
+        round_trip_to_parquet(vec![batch1, batch2], None, Some(Arc::new(schema))).await;
     }
 
     #[tokio::test]
