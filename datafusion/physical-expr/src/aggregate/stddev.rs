@@ -299,18 +299,13 @@ mod tests {
     #[test]
     fn test_stddev_1_input() -> Result<()> {
         let a: ArrayRef = Arc::new(Float64Array::from(vec![1_f64]));
-        let schema = Schema::new(vec![Field::new("a", DataType::Float64, false)]);
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![a])?;
+        generic_test_op!(a, DataType::Float64, Stddev, ScalarValue::Float64(None))
+    }
 
-        let agg = Arc::new(Stddev::new(
-            col("a", &schema)?,
-            "bla".to_string(),
-            DataType::Float64,
-        ));
-        let actual = aggregate(&batch, agg);
-        assert!(actual.is_err());
-
-        Ok(())
+    #[test]
+    fn test_stddev_pop_1_input() -> Result<()> {
+        let a: ArrayRef = Arc::new(Float64Array::from(vec![1_f64]));
+        generic_test_op!(a, DataType::Float64, StddevPop, ScalarValue::from(0_f64))
     }
 
     #[test]
@@ -333,18 +328,13 @@ mod tests {
     #[test]
     fn stddev_i32_all_nulls() -> Result<()> {
         let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
-        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![a])?;
+        generic_test_op!(a, DataType::Int32, Stddev, ScalarValue::Float64(None))
+    }
 
-        let agg = Arc::new(Stddev::new(
-            col("a", &schema)?,
-            "bla".to_string(),
-            DataType::Float64,
-        ));
-        let actual = aggregate(&batch, agg);
-        assert!(actual.is_err());
-
-        Ok(())
+    #[test]
+    fn stddev_pop_i32_all_nulls() -> Result<()> {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
+        generic_test_op!(a, DataType::Int32, StddevPop, ScalarValue::Float64(None))
     }
 
     #[test]

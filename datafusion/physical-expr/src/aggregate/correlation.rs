@@ -367,22 +367,14 @@ mod tests {
         let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
         let b: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
 
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::Int32, true),
-            Field::new("b", DataType::Int32, true),
-        ]);
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![a, b])?;
-
-        let agg = Arc::new(Correlation::new(
-            col("a", &schema)?,
-            col("b", &schema)?,
-            "bla".to_string(),
-            DataType::Float64,
-        ));
-        let actual = aggregate(&batch, agg);
-        assert!(actual.is_err());
-
-        Ok(())
+        generic_test_op2!(
+            a,
+            b,
+            DataType::Int32,
+            DataType::Int32,
+            Correlation,
+            ScalarValue::Float64(None)
+        )
     }
 
     #[test]

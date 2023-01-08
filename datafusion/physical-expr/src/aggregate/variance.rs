@@ -286,13 +286,7 @@ impl Accumulator for VarianceAccumulator {
             }
         };
 
-        if count <= 1 {
-            return Err(DataFusionError::Internal(
-                "At least two values are needed to calculate variance".to_string(),
-            ));
-        }
-
-        if self.count == 0 {
+        if count == 0 {
             Ok(ScalarValue::Float64(None))
         } else {
             Ok(ScalarValue::Float64(Some(self.m2 / count as f64)))
@@ -374,18 +368,13 @@ mod tests {
     #[test]
     fn test_variance_1_input() -> Result<()> {
         let a: ArrayRef = Arc::new(Float64Array::from(vec![1_f64]));
-        let schema = Schema::new(vec![Field::new("a", DataType::Float64, false)]);
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![a])?;
+        generic_test_op!(a, DataType::Float64, Variance, ScalarValue::Float64(None))
+    }
 
-        let agg = Arc::new(Variance::new(
-            col("a", &schema)?,
-            "bla".to_string(),
-            DataType::Float64,
-        ));
-        let actual = aggregate(&batch, agg);
-        assert!(actual.is_err());
-
-        Ok(())
+    #[test]
+    fn test_variance_pop_1_input() -> Result<()> {
+        let a: ArrayRef = Arc::new(Float64Array::from(vec![1_f64]));
+        generic_test_op!(a, DataType::Float64, VariancePop, ScalarValue::from(0_f64))
     }
 
     #[test]
@@ -408,18 +397,13 @@ mod tests {
     #[test]
     fn variance_i32_all_nulls() -> Result<()> {
         let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
-        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![a])?;
+        generic_test_op!(a, DataType::Int32, Variance, ScalarValue::Float64(None))
+    }
 
-        let agg = Arc::new(Variance::new(
-            col("a", &schema)?,
-            "bla".to_string(),
-            DataType::Float64,
-        ));
-        let actual = aggregate(&batch, agg);
-        assert!(actual.is_err());
-
-        Ok(())
+    #[test]
+    fn variance_pop_i32_all_nulls() -> Result<()> {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
+        generic_test_op!(a, DataType::Int32, Variance, ScalarValue::Float64(None))
     }
 
     #[test]

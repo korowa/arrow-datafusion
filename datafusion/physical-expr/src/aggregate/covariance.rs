@@ -361,13 +361,7 @@ impl Accumulator for CovarianceAccumulator {
             }
         };
 
-        if count <= 1 {
-            return Err(DataFusionError::Internal(
-                "At least two values are needed to calculate covariance".to_string(),
-            ));
-        }
-
-        if self.count == 0 {
+        if count == 0 {
             Ok(ScalarValue::Float64(None))
         } else {
             Ok(ScalarValue::Float64(Some(self.algo_const / count as f64)))
@@ -551,26 +545,63 @@ mod tests {
     }
 
     #[test]
+    fn covariance_1_input() -> Result<()> {
+        let a: ArrayRef = Arc::new(Float64Array::from(vec![1_f64]));
+        let b: ArrayRef = Arc::new(Float64Array::from(vec![2_f64]));
+
+        generic_test_op2!(
+            a,
+            b,
+            DataType::Float64,
+            DataType::Float64,
+            Covariance,
+            ScalarValue::Float64(None)
+        )
+    }
+
+    #[test]
+    fn covariance_pop_1_input() -> Result<()> {
+        let a: ArrayRef = Arc::new(Float64Array::from(vec![1_f64]));
+        let b: ArrayRef = Arc::new(Float64Array::from(vec![2_f64]));
+
+        generic_test_op2!(
+            a,
+            b,
+            DataType::Float64,
+            DataType::Float64,
+            CovariancePop,
+            ScalarValue::from(0_f64)
+        )
+    }
+
+    #[test]
     fn covariance_i32_all_nulls() -> Result<()> {
         let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
         let b: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
 
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::Int32, true),
-            Field::new("b", DataType::Int32, true),
-        ]);
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![a, b])?;
+        generic_test_op2!(
+            a,
+            b,
+            DataType::Int32,
+            DataType::Int32,
+            Covariance,
+            ScalarValue::Float64(None)
+        )
+    }
 
-        let agg = Arc::new(Covariance::new(
-            col("a", &schema)?,
-            col("b", &schema)?,
-            "bla".to_string(),
-            DataType::Float64,
-        ));
-        let actual = aggregate(&batch, agg);
-        assert!(actual.is_err());
+    #[test]
+    fn covariance_pop_i32_all_nulls() -> Result<()> {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
+        let b: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
 
-        Ok(())
+        generic_test_op2!(
+            a,
+            b,
+            DataType::Int32,
+            DataType::Int32,
+            CovariancePop,
+            ScalarValue::Float64(None)
+        )
     }
 
     #[test]
