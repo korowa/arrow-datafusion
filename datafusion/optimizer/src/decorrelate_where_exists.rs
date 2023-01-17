@@ -26,7 +26,7 @@ use datafusion_expr::{
     logical_plan::{Filter, JoinType, Subquery},
     Expr, LogicalPlan, LogicalPlanBuilder,
 };
-use std::sync::Arc;
+use std::{iter::once, sync::Arc};
 
 /// Optimizer rule for rewriting subquery filters to joins
 #[derive(Default)]
@@ -167,13 +167,15 @@ fn optimize_exists(
     }
 
     // build subquery side of join - the thing the subquery was querying
-    let mut subqry_plan = LogicalPlanBuilder::from(subqry_filter.input.as_ref().clone());
-    if let Some(expr) = conjunction(other_subqry_exprs) {
-        subqry_plan = subqry_plan.filter(expr)? // if the subquery had additional expressions, restore them
-    }
-    let subqry_plan = subqry_plan.build()?;
+    let subqry_plan = LogicalPlanBuilder::from(subqry_filter.input.as_ref().clone())
+        .build()?;
 
     let join_keys = (subqry_cols, outer_cols);
+    let join_filters = if let Some(expr) = join_filters {
+        conjunction(other_subqry_exprs.into_iter().chain(once(expr)))
+    } else {
+        conjunction(other_subqry_exprs)
+    };
 
     // join our sub query into the main plan
     let join_type = match query_info.negated {
