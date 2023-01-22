@@ -55,7 +55,7 @@ use crate::{
 
 use super::PartitionedFile;
 
-use super::helpers::{expr_applicable_for_cols, pruned_partition_list, split_files};
+use super::helpers::{expr_applicable_for_cols, pruned_partition_list};
 
 /// Configuration for creating a [`ListingTable`]
 #[derive(Debug, Clone)]
@@ -738,37 +738,49 @@ impl ListingTable {
 
         // collect the statistics if required by the config
         let files = file_list.then(|part_file| async {
-            let part_file = part_file?;
-            let statistics = if self.options.collect_stat {
-                match self.collected_statistics.get(&part_file.object_meta) {
-                    Some(statistics) => statistics,
-                    None => {
-                        let statistics = self
-                            .options
-                            .format
-                            .infer_stats(
-                                ctx,
-                                &store,
-                                self.file_schema.clone(),
-                                &part_file.object_meta,
-                            )
-                            .await?;
-                        self.collected_statistics
-                            .save(part_file.object_meta.clone(), statistics.clone());
-                        statistics
-                    }
-                }
-            } else {
-                Statistics::default()
-            };
-            Ok((part_file, statistics)) as Result<(PartitionedFile, Statistics)>
+            let mut part_file = part_file?;
+            let format_metadata = self.options.format.fetch_format_metadata(
+                ctx,
+                &store,
+                self.file_schema.clone(),
+                &part_file.object_meta,
+                self.options.collect_stat,
+            ).await?;
+
+            part_file.available_ranges = format_metadata.file_ranges;
+
+            // let statistics = if self.options.collect_stat {
+            //     match self.collected_statistics.get(&part_file.object_meta) {
+            //         Some(statistics) => statistics,
+            //         None => {
+            //             let statistics = self
+            //                 .options
+            //                 .format
+            //                 .infer_stats(
+            //                     ctx,
+            //                     &store,
+            //                     self.file_schema.clone(),
+            //                     &part_file.object_meta,
+            //                 )
+            //                 .await?;
+            //             self.collected_statistics
+            //                 .save(part_file.object_meta.clone(), statistics.clone());
+            //             statistics
+            //         }
+            //     }
+            // } else {
+            //     Statistics::default()
+            // };
+            Ok((part_file, format_metadata.statistics)) as Result<(PartitionedFile, Statistics)>
         });
 
         let (files, statistics) =
             get_statistics_with_limit(files, self.schema(), limit).await?;
 
+        let splitted = self.options.format.assign_to_partitions(files.clone(), self.options.target_partitions);
+
         Ok((
-            split_files(files, self.options.target_partitions),
+            self.options.format.assign_to_partitions(files.clone(), self.options.target_partitions),
             statistics,
         ))
     }

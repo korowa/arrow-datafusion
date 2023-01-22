@@ -18,12 +18,15 @@
 //! Parquet format abstractions
 
 use std::any::Any;
+use std::cmp;
+use std::iter::once;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
+use itertools::Itertools;
 use datafusion_common::DataFusionError;
 use datafusion_optimizer::utils::conjunction;
 use hashbrown::HashMap;
@@ -33,15 +36,14 @@ use parquet::file::footer::{decode_footer, decode_metadata};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 
-use super::FileFormat;
-use super::FileScanConfig;
+use super::{FileFormat, FileScanConfig, FormatMetadata};
 use crate::arrow::array::{
     BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
 };
 use crate::arrow::datatypes::{DataType, Field};
 use crate::config::ConfigOptions;
 
-use crate::datasource::{create_max_min_accs, get_col_stats};
+use crate::datasource::{create_max_min_accs, get_col_stats, PartitionedFile, listing::FileRange};
 use crate::error::Result;
 use crate::execution::context::SessionState;
 use crate::logical_expr::Expr;
@@ -168,21 +170,23 @@ impl FileFormat for ParquetFormat {
         Ok(Arc::new(schema))
     }
 
-    async fn infer_stats(
+    async fn fetch_format_metadata(
         &self,
         _state: &SessionState,
         store: &Arc<dyn ObjectStore>,
         table_schema: SchemaRef,
         object: &ObjectMeta,
-    ) -> Result<Statistics> {
-        let stats = fetch_statistics(
+        collect_statistics: bool,
+    ) -> Result<FormatMetadata> {
+        let format_metadata = fetch_format_metadata(
             store.as_ref(),
             table_schema,
             object,
             self.metadata_size_hint,
+            collect_statistics,
         )
         .await?;
-        Ok(stats)
+        Ok(format_metadata)
     }
 
     async fn create_physical_plan(
@@ -205,6 +209,45 @@ impl FileFormat for ParquetFormat {
             predicate,
             self.metadata_size_hint(state.config_options()),
         )))
+    }
+
+    fn assign_to_partitions(
+        &self,
+        files: Vec<PartitionedFile>,
+        target_partitions: usize,
+    ) -> Vec<Vec<PartitionedFile>> {
+        if files.is_empty() {
+            return vec![];
+        }
+        let ranges_to_split: usize = files.iter().map(|f| f.available_ranges.len()).sum();
+        let chunk_size = (ranges_to_split + target_partitions - 1) / target_partitions;
+
+        files.iter()
+            .enumerate()
+            .flat_map(|(file_idx, file)| file.available_ranges.clone().into_iter().map(|rg| (file_idx, rg)).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+            .chunks(chunk_size)
+            .map(|chunk| {
+                chunk.into_iter()
+                    .group_by(|(file_idx, _)| file_idx)
+                    .into_iter()
+                    .map(|(file_idx, items)| 
+                        (file_idx, 
+                        items.into_iter().map(|(_, rg)| rg.clone()).reduce(|mut range_acc, range| {
+                            range_acc.start = cmp::min(range_acc.start, range.start);
+                            range_acc.end = cmp::max(range_acc.end, range.end);
+                            range_acc
+                        }))
+                    )
+                    .map(|(file_idx, range)| {
+                        let mut file = files[file_idx.clone()].clone();
+                        file.range = range;
+                        file.available_ranges = vec![];
+                        file
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
     }
 }
 
@@ -452,14 +495,37 @@ async fn fetch_schema(
     Ok(schema)
 }
 
-/// Read and parse the statistics of the Parquet file at location `path`
-async fn fetch_statistics(
+async fn fetch_format_metadata(
     store: &dyn ObjectStore,
     table_schema: SchemaRef,
     file: &ObjectMeta,
     metadata_size_hint: Option<usize>,
-) -> Result<Statistics> {
+    collect_statistics: bool,
+) -> Result<FormatMetadata> {
     let metadata = fetch_parquet_metadata(store, file, metadata_size_hint).await?;
+
+    let statistics = if collect_statistics {
+        extract_statistics_from_metadata(&metadata, table_schema).await?
+    } else {
+        Statistics::default()
+    };
+
+    let row_group_ranges = metadata.row_groups()
+        .iter()
+        .map(|rg| rg.column(0).file_offset())
+        .chain(once(file.size as i64))
+        .tuple_windows()
+        .map(|(start, end)| FileRange{ start, end })
+        .collect::<Vec<_>>();
+
+    Ok(FormatMetadata::new(statistics, row_group_ranges))
+}
+
+/// Read and parse the statistics of the Parquet file at location `path`
+async fn extract_statistics_from_metadata(
+    metadata: &ParquetMetaData,
+    table_schema: SchemaRef,
+) -> Result<Statistics> {
     let file_metadata = metadata.file_metadata();
 
     let file_schema = parquet_to_arrow_schema(
@@ -529,14 +595,12 @@ async fn fetch_statistics(
         None
     };
 
-    let statistics = Statistics {
+    Ok(Statistics {
         num_rows: Some(num_rows as usize),
         total_byte_size: Some(total_byte_size as usize),
         column_statistics: column_stats,
         is_exact: true,
-    };
-
-    Ok(statistics)
+    })
 }
 
 #[cfg(test)]
@@ -643,8 +707,8 @@ mod tests {
         let format = ParquetFormat::default();
         let schema = format.infer_schema(&ctx, &store, &meta).await.unwrap();
 
-        let stats =
-            fetch_statistics(store.as_ref(), schema.clone(), &meta[0], None).await?;
+        let parquet_meta = fetch_parquet_metadata(store.as_ref(), &meta[0], None).await?;
+        let stats = extract_statistics_from_metadata(&parquet_meta, schema.clone()).await?;
 
         assert_eq!(stats.num_rows, Some(3));
         let c1_stats = &stats.column_statistics.as_ref().expect("missing c1 stats")[0];
@@ -652,7 +716,8 @@ mod tests {
         assert_eq!(c1_stats.null_count, Some(1));
         assert_eq!(c2_stats.null_count, Some(3));
 
-        let stats = fetch_statistics(store.as_ref(), schema, &meta[1], None).await?;
+        let parquet_meta = fetch_parquet_metadata(store.as_ref(), &meta[0], None).await?;
+        let stats = extract_statistics_from_metadata(&parquet_meta, schema.clone()).await?;
         assert_eq!(stats.num_rows, Some(3));
         let c1_stats = &stats.column_statistics.as_ref().expect("missing c1 stats")[0];
         let c2_stats = &stats.column_statistics.as_ref().expect("missing c2 stats")[1];
@@ -795,9 +860,8 @@ mod tests {
             .await
             .unwrap();
 
-        let stats =
-            fetch_statistics(store.upcast().as_ref(), schema.clone(), &meta[0], Some(9))
-                .await?;
+        let parquet_meta = fetch_parquet_metadata(store.upcast().as_ref(), &meta[0], Some(9)).await?;
+        let stats = extract_statistics_from_metadata(&parquet_meta, schema.clone()).await?;
 
         assert_eq!(stats.num_rows, Some(3));
         let c1_stats = &stats.column_statistics.as_ref().expect("missing c1 stats")[0];
@@ -824,13 +888,15 @@ mod tests {
             .infer_schema(&ctx, &store.upcast(), &meta)
             .await
             .unwrap();
-        let stats = fetch_statistics(
+        let stats = fetch_format_metadata(
             store.upcast().as_ref(),
             schema.clone(),
             &meta[0],
             Some(size_hint),
+            true,
         )
-        .await?;
+        .await?
+        .statistics;
 
         assert_eq!(stats.num_rows, Some(3));
         let c1_stats = &stats.column_statistics.as_ref().expect("missing c1 stats")[0];

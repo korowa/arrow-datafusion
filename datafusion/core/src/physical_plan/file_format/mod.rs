@@ -854,6 +854,7 @@ mod tests {
             partition_values: vec![],
             range: None,
             extensions: None,
+            available_ranges: None,
         }
     }
 }

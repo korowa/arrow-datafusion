@@ -1418,6 +1418,7 @@ mod tests {
             ],
             range: None,
             extensions: None,
+            available_ranges: None,
         };
 
         let parquet_exec = ParquetExec::new(
@@ -1483,6 +1484,7 @@ mod tests {
             partition_values: vec![],
             range: None,
             extensions: None,
+            available_ranges: None,
         };
 
         let parquet_exec = ParquetExec::new(

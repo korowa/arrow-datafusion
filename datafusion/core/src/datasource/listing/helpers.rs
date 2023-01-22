@@ -235,6 +235,7 @@ pub async fn pruned_partition_list<'a>(
                     object_meta,
                     range: None,
                     extensions: None,
+                    available_ranges: vec![],
                 }))
             },
         )))
@@ -356,6 +357,7 @@ fn batches_to_paths(batches: &[RecordBatch]) -> Result<Vec<PartitionedFile>> {
                         .collect(),
                     range: None,
                     extensions: None,
+                    available_ranges: vec![],
                 })
             })
         })

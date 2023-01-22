@@ -31,14 +31,37 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::arrow::datatypes::SchemaRef;
+use crate::datasource::listing::{FileRange, PartitionedFile};
 use crate::error::Result;
 use crate::logical_expr::Expr;
-use crate::physical_plan::file_format::FileScanConfig;
+use crate::physical_plan::file_format::{FileScanConfig};
 use crate::physical_plan::{ExecutionPlan, Statistics};
 
 use crate::execution::context::SessionState;
 use async_trait::async_trait;
 use object_store::{ObjectMeta, ObjectStore};
+
+/// FormatMetadata - format-specific file metadata
+pub struct FormatMetadata {
+    pub statistics: Statistics,
+    pub file_ranges: Vec<FileRange>,
+}
+
+impl FormatMetadata {
+    pub fn new(statistics: Statistics, file_ranges: Vec<FileRange>) -> FormatMetadata {
+        Self {
+            statistics,
+            file_ranges,
+        }
+    }
+
+    pub fn new_with_statistics(statistics: Statistics) -> FormatMetadata {
+        Self {
+            statistics,
+            file_ranges: vec![],
+        }
+    }
+}
 
 /// This trait abstracts all the file format specific implementations
 /// from the `TableProvider`. This helps code re-utilization across
@@ -67,13 +90,16 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
     /// and may be a superset of the schema contained in this file.
     ///
     /// TODO: should the file source return statistics for only columns referred to in the table schema?
-    async fn infer_stats(
+    async fn fetch_format_metadata(
         &self,
-        state: &SessionState,
-        store: &Arc<dyn ObjectStore>,
-        table_schema: SchemaRef,
-        object: &ObjectMeta,
-    ) -> Result<Statistics>;
+        _state: &SessionState,
+        _store: &Arc<dyn ObjectStore>,
+        _table_schema: SchemaRef,
+        _object: &ObjectMeta,
+        _collect_statistics: bool,
+    ) -> Result<FormatMetadata> {
+        Ok(FormatMetadata::new_with_statistics(Statistics::default()))
+    }
 
     /// Take a list of files and convert it to the appropriate executor
     /// according to this file format.
@@ -83,6 +109,26 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
         conf: FileScanConfig,
         filters: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>>;
+
+    /// Splits list of [PartitionedFile] objects across target partitions
+    /// 
+    /// Default implementation simply divides file list into `target_partitions` chunks
+    /// and assigns each chunk to partition
+    fn assign_to_partitions(
+        &self,
+        files: Vec<PartitionedFile>,
+        target_partitions: usize,
+    ) -> Vec<Vec<PartitionedFile>> {
+        if files.is_empty() {
+            return vec![];
+        }
+        // effectively this is div with rounding up instead of truncating
+        let chunk_size = (files.len() + target_partitions - 1) / target_partitions;
+        files
+            .chunks(chunk_size)
+            .map(|c| c.to_vec())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -116,14 +162,16 @@ pub(crate) mod test_util {
         let file_schema = format.infer_schema(state, &store, &[meta.clone()]).await?;
 
         let statistics = format
-            .infer_stats(state, &store, file_schema.clone(), &meta)
-            .await?;
+            .fetch_format_metadata(state, &store, file_schema.clone(), &meta, true)
+            .await?
+            .statistics;
 
         let file_groups = vec![vec![PartitionedFile {
             object_meta: meta,
             partition_values: vec![],
             range: None,
             extensions: None,
+            available_ranges: None,
         }]];
 
         let exec = format

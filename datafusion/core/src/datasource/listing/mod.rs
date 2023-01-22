@@ -61,6 +61,8 @@ pub struct PartitionedFile {
     pub range: Option<FileRange>,
     /// An optional field for user defined per object metadata  
     pub extensions: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Available file ranges for scan parallelization
+    pub available_ranges: Vec<FileRange>,
 }
 
 impl PartitionedFile {
@@ -75,6 +77,7 @@ impl PartitionedFile {
             partition_values: vec![],
             range: None,
             extensions: None,
+            available_ranges: vec![],
         }
     }
 
@@ -89,6 +92,7 @@ impl PartitionedFile {
             partition_values: vec![],
             range: Some(FileRange { start, end }),
             extensions: None,
+            available_ranges: vec![],
         }
     }
 }
@@ -100,6 +104,7 @@ impl From<ObjectMeta> for PartitionedFile {
             partition_values: vec![],
             range: None,
             extensions: None,
+            available_ranges: vec![],
         }
     }
 }
