@@ -34,12 +34,12 @@ use arrow::compute::{concat_batches, take, SortOptions};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use futures::{Stream, StreamExt};
 
 use crate::error::DataFusionError;
 use crate::error::Result;
 use crate::execution::context::TaskContext;
+use crate::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use crate::logical_expr::JoinType;
 use crate::physical_plan::expressions::Column;
 use crate::physical_plan::expressions::PhysicalSortExpr;
