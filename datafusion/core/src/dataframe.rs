@@ -30,8 +30,8 @@ use parquet::file::properties::WriterProperties;
 use datafusion_common::from_slice::FromSlice;
 use datafusion_common::{Column, DFSchema, ScalarValue};
 use datafusion_expr::{
-    avg, count, is_null, max, median, min, stddev, TableProviderFilterPushDown,
-    UNNAMED_TABLE,
+    avg, count, is_null, max, median, min, stddev, utils::COUNT_STAR_EXPANSION,
+    TableProviderFilterPushDown, UNNAMED_TABLE,
 };
 
 use crate::arrow::datatypes::Schema;
@@ -630,7 +630,7 @@ impl DataFrame {
         let rows = self
             .aggregate(
                 vec![],
-                vec![datafusion_expr::count(Expr::Literal(ScalarValue::Null))],
+                vec![datafusion_expr::count(Expr::Literal(COUNT_STAR_EXPANSION))],
             )?
             .collect()
             .await?;
@@ -1372,7 +1372,7 @@ mod tests {
         let join = left
             .join_on(right, JoinType::Inner, [col("c1").eq(col("c1"))])
             .expect_err("join didn't fail check");
-        let expected = "Schema error: Ambiguous reference to unqualified field 'c1'";
+        let expected = "Schema error: Ambiguous reference to unqualified field \"c1\"";
         assert_eq!(join.to_string(), expected);
 
         Ok(())
