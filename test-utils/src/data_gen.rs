@@ -63,6 +63,7 @@ struct BatchBuilder {
     response_bytes: Int32Builder,
     response_status: UInt16Builder,
     prices_status: Decimal128Builder,
+    host_string: StringBuilder,
 
     options: GeneratorOptions,
     row_count: usize,
@@ -93,6 +94,7 @@ impl BatchBuilder {
             Field::new("response_bytes", DataType::Int32, true),
             Field::new("response_status", DataType::UInt16, false),
             Field::new("decimal_price", DataType::Decimal128(38, 0), false),
+            Field::new("host_string", DataType::Utf8, false),
         ]))
     }
 
@@ -143,6 +145,7 @@ impl BatchBuilder {
 
         self.service.append(service).unwrap();
         self.host.append(host).unwrap();
+        self.host_string.append_value(host);
         self.pod.append(pod).unwrap();
         self.container.append(container).unwrap();
         self.image.append(image).unwrap();
@@ -196,6 +199,7 @@ impl BatchBuilder {
                         .with_precision_and_scale(38, 0)
                         .unwrap(),
                 ),
+                Arc::new(self.host_string.finish()),
             ],
         )
         .unwrap()

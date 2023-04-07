@@ -24,6 +24,8 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt::Formatter;
+use std::fs::File;
+use std::io::BufReader;
 use std::mem;
 use std::ops::Range;
 use std::pin::Pin;
@@ -34,15 +36,19 @@ use arrow::array::*;
 use arrow::compute::{concat_batches, take, SortOptions};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
+use arrow::ipc::reader::FileReader;
 use arrow::record_batch::RecordBatch;
 use datafusion_physical_expr::PhysicalSortRequirement;
 use futures::{Stream, StreamExt};
+use tempfile::NamedTempFile;
 
 use crate::error::DataFusionError;
 use crate::error::Result;
 use crate::execution::context::TaskContext;
 use crate::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use crate::execution::runtime_env::RuntimeEnv;
 use crate::logical_expr::JoinType;
+use crate::physical_plan::common::IPCWriter;
 use crate::physical_plan::expressions::Column;
 use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::joins::utils::{
@@ -341,6 +347,8 @@ impl ExecutionPlan for SortMergeJoinExec {
         let reservation = MemoryConsumer::new(format!("SMJStream[{partition}]"))
             .register(context.memory_pool());
 
+        let runtime = context.runtime_env();
+
         // create join stream
         Ok(Box::pin(SMJStream::try_new(
             self.schema.clone(),
@@ -353,6 +361,7 @@ impl ExecutionPlan for SortMergeJoinExec {
             self.join_type,
             batch_size,
             SortMergeJoinMetrics::new(partition, &self.metrics),
+            runtime,
             reservation,
         )?))
     }
@@ -480,6 +489,7 @@ struct StreamedJoinedChunk {
 struct StreamedBatch {
     pub batch: RecordBatch,
     pub idx: usize,
+    pub range_start: usize,
     pub join_arrays: Vec<ArrayRef>,
 
     // Chunks of indices from buffered side (may be nulls) joined to streamed
@@ -487,13 +497,13 @@ struct StreamedBatch {
     // Index of currently scanned batch from buffered data
     pub buffered_batch_idx: Option<usize>,
 }
-
 impl StreamedBatch {
     fn new(batch: RecordBatch, on_column: &[Column]) -> Self {
         let join_arrays = join_arrays(&batch, on_column);
         StreamedBatch {
             batch,
             idx: 0,
+            range_start: 0,
             join_arrays,
             output_indices: vec![],
             buffered_batch_idx: None,
@@ -504,6 +514,7 @@ impl StreamedBatch {
         StreamedBatch {
             batch: RecordBatch::new_empty(schema),
             idx: 0,
+            range_start: 0,
             join_arrays: vec![],
             output_indices: vec![],
             buffered_batch_idx: None,
@@ -535,6 +546,17 @@ impl StreamedBatch {
             current_chunk.buffered_indices.append_null();
         }
     }
+
+    fn scanning_reset(&mut self) {
+        self.idx = self.range_start;
+    }
+
+    fn is_range(&mut self) -> Result<bool> {
+        if self.idx == self.batch.num_rows() - 1 {
+            return Ok(false);
+        }
+        is_join_arrays_equal(&self.join_arrays, self.idx, &self.join_arrays, self.idx + 1)
+    }
 }
 
 /// A buffered batch that contains contiguous rows with same join key
@@ -551,7 +573,6 @@ struct BufferedBatch {
     /// Size estimation used for reserving / releasing memory
     pub size_estimation: usize,
 }
-
 impl BufferedBatch {
     fn new(batch: RecordBatch, range: Range<usize>, on_column: &[Column]) -> Self {
         let join_arrays = join_arrays(&batch, on_column);
@@ -616,8 +637,6 @@ struct SMJStream {
     pub current_ordering: Ordering,
     /// Join key columns of streamed
     pub on_streamed: Vec<Column>,
-    /// Join key columns of buffered
-    pub on_buffered: Vec<Column>,
     /// Staging output array builders
     pub output_record_batches: Vec<RecordBatch>,
     /// Staging output size, including output batches and staging joined results
@@ -628,8 +647,6 @@ struct SMJStream {
     pub join_type: JoinType,
     /// Metrics
     pub join_metrics: SortMergeJoinMetrics,
-    /// Memory reservation
-    pub reservation: MemoryReservation,
 }
 
 impl RecordBatchStream for SMJStream {
@@ -707,18 +724,48 @@ impl Stream for SMJStream {
                 SMJState::JoinOutput => {
                     self.join_partial()?;
 
-                    if self.output_size < self.batch_size {
-                        if self.buffered_data.scanning_finished() {
-                            self.buffered_data.scanning_reset();
-                            self.state = SMJState::Init;
-                        }
-                    } else {
+                    // Produce output batch if possible
+                    if self.output_size >= self.batch_size {
                         self.freeze_all()?;
                         if !self.output_record_batches.is_empty() {
                             let record_batch = self.output_record_batch_and_reset()?;
                             return Poll::Ready(Some(Ok(record_batch)));
                         }
                         return Poll::Pending;
+                    }
+
+                    if !self.buffered_data.scanning_finished() {
+                        continue;
+                    }
+
+                    let buffer_has_next_spill = self.buffered_data.has_next_spill();
+                    let stream_is_range = self.streamed_batch.is_range()?;
+
+                    // Reset scanning positions for buffered data
+                    self.buffered_data.scanning_reset();
+
+                    // If stream-side is in range -- advance to next streamed idx and join current buffer again
+                    if buffer_has_next_spill && stream_is_range {
+                        self.streamed_batch.idx += 1;
+                    }
+                    // If stream-side is in range and all spills scanned -- set state to Init for further polling
+                    else if stream_is_range {
+                        self.state = SMJState::Init;
+                    }
+                    // If stream-side range scanned, but there are more spills to read
+                    // 1) stage all output batches (buffered side will be replaced with next spill contents)
+                    // 2) load next spill in `buffered_data`
+                    // 3) reset stream-side scanning range to join it with next spill
+                    else if buffer_has_next_spill {
+                        self.freeze_all()?;
+                        self.buffered_data.fetch_next_spill()?;
+                        self.streamed_batch.scanning_reset();
+                    }
+                    // If stream-side not in range and all spills are read - reset spills
+                    else {
+                        self.freeze_all()?;
+                        self.buffered_data.spill_reset()?;
+                        self.state = SMJState::Init;
                     }
                 }
                 SMJState::Exhausted => {
@@ -747,10 +794,15 @@ impl SMJStream {
         join_type: JoinType,
         batch_size: usize,
         join_metrics: SortMergeJoinMetrics,
+        runtime: Arc<RuntimeEnv>,
         reservation: MemoryReservation,
     ) -> Result<Self> {
         let streamed_schema = streamed.schema();
         let buffered_schema = buffered.schema();
+
+        let buffered_data =
+            BufferedData::new(buffered_schema.clone(), runtime, reservation, on_buffered);
+
         Ok(Self {
             state: SMJState::Init,
             sort_options,
@@ -761,20 +813,18 @@ impl SMJStream {
             streamed,
             buffered,
             streamed_batch: StreamedBatch::new_empty(streamed_schema),
-            buffered_data: BufferedData::default(),
+            buffered_data,
             streamed_joined: false,
             buffered_joined: false,
             streamed_state: StreamedState::Init,
             buffered_state: BufferedState::Init,
             current_ordering: Ordering::Equal,
             on_streamed,
-            on_buffered,
             output_record_batches: vec![],
             output_size: 0,
             batch_size,
             join_type,
             join_metrics,
-            reservation,
         })
     }
 
@@ -786,6 +836,7 @@ impl SMJStream {
                     if self.streamed_batch.idx + 1 < self.streamed_batch.batch.num_rows()
                     {
                         self.streamed_batch.idx += 1;
+                        self.streamed_batch.range_start = self.streamed_batch.idx;
                         self.streamed_state = StreamedState::Ready;
                         return Poll::Ready(Some(Ok(())));
                     } else {
@@ -825,15 +876,17 @@ impl SMJStream {
         loop {
             match &self.buffered_state {
                 BufferedState::Init => {
+                    self.buffered_data.shrink_spills()?;
                     // pop previous buffered batches
                     while !self.buffered_data.batches.is_empty() {
                         let head_batch = self.buffered_data.head_batch();
                         if head_batch.range.end == head_batch.batch.num_rows() {
                             self.freeze_dequeuing_buffered()?;
-                            if let Some(buffered_batch) =
-                                self.buffered_data.batches.pop_front()
-                            {
-                                self.reservation.shrink(buffered_batch.size_estimation);
+                            let batch = self.buffered_data.batches.pop_front();
+                            if let Some(buffered_batch) = batch {
+                                self.buffered_data
+                                    .reservation
+                                    .shrink(buffered_batch.size_estimation);
                             }
                         } else {
                             break;
@@ -860,14 +913,7 @@ impl SMJStream {
                         self.join_metrics.input_batches.add(1);
                         self.join_metrics.input_rows.add(batch.num_rows());
                         if batch.num_rows() > 0 {
-                            let buffered_batch =
-                                BufferedBatch::new(batch, 0..1, &self.on_buffered);
-                            self.reservation.try_grow(buffered_batch.size_estimation)?;
-                            self.join_metrics
-                                .peak_mem_used
-                                .set_max(self.reservation.size());
-
-                            self.buffered_data.batches.push_back(buffered_batch);
+                            self.buffered_data.insert_batch(batch)?;
                             self.buffered_state = BufferedState::PollingRest;
                         }
                     }
@@ -887,6 +933,7 @@ impl SMJStream {
                             )? {
                                 self.buffered_data.tail_batch_mut().range.end += 1;
                             } else {
+                                self.buffered_data.prepare_for_scanning()?;
                                 self.buffered_state = BufferedState::Ready;
                                 return Poll::Ready(Some(Ok(())));
                             }
@@ -897,23 +944,14 @@ impl SMJStream {
                                 return Poll::Pending;
                             }
                             Poll::Ready(None) => {
+                                self.buffered_data.prepare_for_scanning()?;
                                 self.buffered_state = BufferedState::Ready;
                             }
                             Poll::Ready(Some(batch)) => {
                                 self.join_metrics.input_batches.add(1);
                                 self.join_metrics.input_rows.add(batch.num_rows());
                                 if batch.num_rows() > 0 {
-                                    let buffered_batch = BufferedBatch::new(
-                                        batch,
-                                        0..0,
-                                        &self.on_buffered,
-                                    );
-                                    self.reservation
-                                        .try_grow(buffered_batch.size_estimation)?;
-                                    self.join_metrics
-                                        .peak_mem_used
-                                        .set_max(self.reservation.size());
-                                    self.buffered_data.batches.push_back(buffered_batch);
+                                    self.buffered_data.insert_batch(batch)?;
                                 }
                             }
                         }
@@ -953,6 +991,9 @@ impl SMJStream {
     fn join_partial(&mut self) -> Result<()> {
         let mut join_streamed = false;
         let mut join_buffered = false;
+
+        let last_buffered_pass =
+            self.current_ordering == Ordering::Greater && !self.buffered_joined;
 
         // determine whether we need to join streamed/buffered rows
         match self.current_ordering {
@@ -1014,7 +1055,9 @@ impl SMJStream {
 
                 if self.buffered_data.scanning_finished() {
                     self.streamed_joined = join_streamed;
-                    self.buffered_joined = true;
+                    if !last_buffered_pass {
+                        self.buffered_joined = true;
+                    }
                 }
             }
         } else {
@@ -1157,17 +1200,158 @@ impl SMJStream {
 }
 
 /// Buffered data contains all buffered batches with one unique join key
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BufferedData {
     /// Buffered batches with the same key
     pub batches: VecDeque<BufferedBatch>,
+    /// Spill files
+    pub spills: Vec<(NamedTempFile, Vec<Range<usize>>)>,
+    /// Buffered-side schema
+    pub schema: SchemaRef,
+    /// spill file currently loaded to memory
+    pub scanning_spill_idx: usize,
     /// current scanning batch index used in join_partial()
     pub scanning_batch_idx: usize,
     /// current scanning offset used in join_partial()
     pub scanning_offset: usize,
+    /// runtime env
+    pub runtime: Arc<RuntimeEnv>,
+    /// memory reservation
+    pub reservation: MemoryReservation,
+    /// join key columns
+    pub join_key: Vec<Column>,
 }
-
 impl BufferedData {
+    fn new(
+        schema: SchemaRef,
+        runtime: Arc<RuntimeEnv>,
+        reservation: MemoryReservation,
+        join_key: Vec<Column>,
+    ) -> Self {
+        Self {
+            batches: VecDeque::default(),
+            spills: Vec::default(),
+            schema,
+            scanning_spill_idx: 0,
+            scanning_batch_idx: 0,
+            scanning_offset: 0,
+            runtime,
+            reservation,
+            join_key,
+        }
+    }
+
+    fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let buffered_batch = BufferedBatch::new(batch, 0..0, &self.join_key);
+
+        if self
+            .reservation
+            .try_grow(buffered_batch.size_estimation)
+            .is_err()
+        {
+            self.spill()?;
+            self.reservation.grow(buffered_batch.size_estimation)
+        };
+
+        self.batches.push_back(buffered_batch);
+
+        // self.join_metrics
+        //     .peak_mem_used
+        //     .set_max(self.reservation.size());
+
+        Ok(())
+    }
+
+    fn spill(&mut self) -> Result<()> {
+        if self.batches.is_empty() {
+            return Ok(());
+        }
+
+        let spillfile = self.runtime.disk_manager.create_tmp_file("SortMergeJoin")?;
+        let mut writer = IPCWriter::new(spillfile.path(), &self.schema)?;
+
+        // Try fold - to get result range
+        let ranges = self
+            .batches
+            .drain(..)
+            .map(|b| {
+                // Spill inner batch
+                writer.write(&b.batch)?;
+
+                Ok(b.range)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writer.finish()?;
+
+        self.reservation.free();
+        self.spills.push((spillfile, ranges));
+
+        Ok(())
+    }
+
+    fn read_spill(&mut self, spill_idx: usize) -> Result<()> {
+        let (spillfile, ranges) = self.spills.get(spill_idx).ok_or_else(|| {
+            DataFusionError::Internal("Unable to read spill".to_string())
+        })?;
+        let file = BufReader::new(File::open(spillfile.path())?);
+        let reader = FileReader::try_new(file, None)?;
+
+        self.batches.clear();
+        self.reservation.free();
+
+        for (read_result, range) in reader.zip(ranges) {
+            let batch = read_result?;
+            let buffered_batch = BufferedBatch::new(batch, range.clone(), &self.join_key);
+            self.reservation.grow(buffered_batch.size_estimation);
+            self.batches.push_back(buffered_batch);
+        }
+
+        Ok(())
+    }
+
+    pub fn has_spills(&self) -> bool {
+        !self.spills.is_empty()
+    }
+
+    pub fn spill_reset(&mut self) -> Result<()> {
+        if !self.has_spills() {
+            return Ok(());
+        }
+        self.scanning_spill_idx = 0;
+        self.read_spill(0)
+    }
+
+    pub fn fetch_next_spill(&mut self) -> Result<()> {
+        self.scanning_spill_idx += 1;
+        self.read_spill(self.scanning_spill_idx)
+    }
+
+    pub fn has_next_spill(&self) -> bool {
+        self.has_spills() && self.scanning_spill_idx != self.spills.len() - 1
+    }
+
+    pub fn shrink_spills(&mut self) -> Result<()> {
+        if !self.has_spills() {
+            return Ok(());
+        }
+        self.read_spill(self.spills.len() - 1)?;
+        self.spills.clear();
+
+        Ok(())
+    }
+
+    pub fn prepare_for_scanning(&mut self) -> Result<()> {
+        if !self.has_spills() {
+            return Ok(());
+        }
+
+        self.spill()?;
+        self.read_spill(0)?;
+        self.scanning_spill_idx = 0;
+
+        Ok(())
+    }
+
     pub fn head_batch(&self) -> &BufferedBatch {
         self.batches.front().unwrap()
     }
@@ -1396,6 +1580,7 @@ mod tests {
 
     use crate::common::assert_contains;
     use crate::error::Result;
+    use crate::execution::disk_manager::DiskManagerConfig;
     use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
     use crate::logical_expr::JoinType;
     use crate::physical_plan::expressions::Column;
@@ -1530,7 +1715,19 @@ mod tests {
         join_type: JoinType,
     ) -> Result<(Vec<String>, Vec<RecordBatch>)> {
         let sort_options = vec![SortOptions::default(); on.len()];
-        join_collect_with_options(left, right, on, join_type, sort_options, false).await
+        join_collect_with_options(left, right, on, join_type, sort_options, false, false)
+            .await
+    }
+
+    async fn spilled_join_collect(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        on: JoinOn,
+        join_type: JoinType,
+    ) -> Result<(Vec<String>, Vec<RecordBatch>)> {
+        let sort_options = vec![SortOptions::default(); on.len()];
+        join_collect_with_options(left, right, on, join_type, sort_options, false, true)
+            .await
     }
 
     async fn join_collect_with_options(
@@ -1540,9 +1737,8 @@ mod tests {
         join_type: JoinType,
         sort_options: Vec<SortOptions>,
         null_equals_null: bool,
+        force_spilling: bool,
     ) -> Result<(Vec<String>, Vec<RecordBatch>)> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
         let join = join_with_options(
             left,
             right,
@@ -1552,6 +1748,17 @@ mod tests {
             null_equals_null,
         )?;
         let columns = columns(&join.schema());
+
+        let task_ctx = if force_spilling {
+            let runtime_config = RuntimeConfig::new().with_memory_limit(0, 1.0);
+            let runtime = Arc::new(RuntimeEnv::new(runtime_config)?);
+            let session_config = SessionConfig::default();
+            let session_ctx = SessionContext::with_config_rt(session_config, runtime);
+            session_ctx.task_ctx()
+        } else {
+            let session_ctx = SessionContext::new();
+            session_ctx.task_ctx()
+        };
 
         let stream = join.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
@@ -1754,11 +1961,12 @@ mod tests {
             vec![
                 SortOptions {
                     descending: true,
-                    nulls_first: false,
+                    nulls_first: false
                 };
                 2
             ],
             true,
+            false,
         )
         .await?;
         let expected = vec![
@@ -2295,61 +2503,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overallocation_single_batch() -> Result<()> {
-        let left = build_table(
-            ("a1", &vec![0, 1, 2, 3, 4, 5]),
-            ("b1", &vec![1, 2, 3, 4, 5, 6]),
-            ("c1", &vec![4, 5, 6, 7, 8, 9]),
-        );
-        let right = build_table(
-            ("a2", &vec![0, 10, 20, 30, 40]),
-            ("b2", &vec![1, 3, 4, 6, 8]),
-            ("c2", &vec![50, 60, 70, 80, 90]),
-        );
-        let on = vec![(
-            Column::new_with_schema("b1", &left.schema())?,
-            Column::new_with_schema("b2", &right.schema())?,
-        )];
-        let sort_options = vec![SortOptions::default(); on.len()];
-
-        let join_types = vec![
-            JoinType::Inner,
-            JoinType::Left,
-            JoinType::Right,
-            JoinType::Full,
-            JoinType::LeftSemi,
-            JoinType::LeftAnti,
-        ];
-
-        for join_type in join_types {
-            let runtime_config = RuntimeConfig::new().with_memory_limit(100, 1.0);
-            let runtime = Arc::new(RuntimeEnv::new(runtime_config)?);
-            let session_config = SessionConfig::default().with_batch_size(50);
-            let session_ctx = SessionContext::with_config_rt(session_config, runtime);
-            let task_ctx = session_ctx.task_ctx();
-            let join = join_with_options(
-                left.clone(),
-                right.clone(),
-                on.clone(),
-                join_type,
-                sort_options.clone(),
-                false,
-            )?;
-
-            let stream = join.execute(0, task_ctx)?;
-            let err = common::collect(stream).await.unwrap_err();
-
-            assert_contains!(
-                err.to_string(),
-                "Resources exhausted: Failed to allocate additional"
-            );
-            assert_contains!(err.to_string(), "SMJStream[0]");
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn overallocation_multi_batch() -> Result<()> {
         let left_batch_1 = build_table_i32(
             ("a1", &vec![0, 1]),
@@ -2398,7 +2551,9 @@ mod tests {
         ];
 
         for join_type in join_types {
-            let runtime_config = RuntimeConfig::new().with_memory_limit(100, 1.0);
+            let runtime_config = RuntimeConfig::new()
+                .with_disk_manager(DiskManagerConfig::Disabled)
+                .with_memory_limit(100, 1.0);
             let runtime = Arc::new(RuntimeEnv::new(runtime_config)?);
             let session_config = SessionConfig::default().with_batch_size(50);
             let session_ctx = SessionContext::with_config_rt(session_config, runtime);
@@ -2417,10 +2572,465 @@ mod tests {
 
             assert_contains!(
                 err.to_string(),
-                "Resources exhausted: Failed to allocate additional"
+                "Resources exhausted: Memory Exhausted while SortMergeJoin (DiskManager is disabled)"
             );
-            assert_contains!(err.to_string(), "SMJStream[0]");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_inner_spill_single_key() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 1]),
+            ("b1", &vec![1, 1]),
+            ("c1", &vec![4, 5]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![2, 3]),
+            ("b1", &vec![1, 1]),
+            ("c1", &vec![6, 7]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 10]),
+            ("b2", &vec![1, 1]),
+            ("c2", &vec![50, 60]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![20, 30]),
+            ("b2", &vec![1, 1]),
+            ("c2", &vec![70, 80]),
+        );
+        let right_batch_3 =
+            build_table_i32(("a2", &vec![40]), ("b2", &vec![1]), ("c2", &vec![90]));
+        let left = build_table_from_batches(vec![left_batch_1, left_batch_2]);
+        let right =
+            build_table_from_batches(vec![right_batch_1, right_batch_2, right_batch_3]);
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+
+        let (_, batches) = spilled_join_collect(left, right, on, JoinType::Inner).await?;
+        let expected = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 0  | 1  | 4  | 0  | 1  | 50 |",
+            "| 0  | 1  | 4  | 10 | 1  | 60 |",
+            "| 1  | 1  | 5  | 0  | 1  | 50 |",
+            "| 1  | 1  | 5  | 10 | 1  | 60 |",
+            "| 0  | 1  | 4  | 20 | 1  | 70 |",
+            "| 0  | 1  | 4  | 30 | 1  | 80 |",
+            "| 1  | 1  | 5  | 20 | 1  | 70 |",
+            "| 1  | 1  | 5  | 30 | 1  | 80 |",
+            "| 0  | 1  | 4  | 40 | 1  | 90 |",
+            "| 1  | 1  | 5  | 40 | 1  | 90 |",
+            "| 2  | 1  | 6  | 0  | 1  | 50 |",
+            "| 2  | 1  | 6  | 10 | 1  | 60 |",
+            "| 3  | 1  | 7  | 0  | 1  | 50 |",
+            "| 3  | 1  | 7  | 10 | 1  | 60 |",
+            "| 2  | 1  | 6  | 20 | 1  | 70 |",
+            "| 2  | 1  | 6  | 30 | 1  | 80 |",
+            "| 3  | 1  | 7  | 20 | 1  | 70 |",
+            "| 3  | 1  | 7  | 30 | 1  | 80 |",
+            "| 2  | 1  | 6  | 40 | 1  | 90 |",
+            "| 3  | 1  | 7  | 40 | 1  | 90 |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_inner_spill_multiple_keys() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 1]),
+            ("b1", &vec![1, 2]),
+            ("c1", &vec![4, 5]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![2, 3]),
+            ("b1", &vec![2, 2]),
+            ("c1", &vec![6, 7]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 10]),
+            ("b2", &vec![1, 1]),
+            ("c2", &vec![50, 60]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![20, 30]),
+            ("b2", &vec![1, 2]),
+            ("c2", &vec![70, 80]),
+        );
+        let right_batch_3 =
+            build_table_i32(("a2", &vec![40]), ("b2", &vec![2]), ("c2", &vec![90]));
+        let left = build_table_from_batches(vec![left_batch_1, left_batch_2]);
+        let right =
+            build_table_from_batches(vec![right_batch_1, right_batch_2, right_batch_3]);
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+
+        let (_, batches) = spilled_join_collect(left, right, on, JoinType::Inner).await?;
+        let expected = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 0  | 1  | 4  | 0  | 1  | 50 |",
+            "| 0  | 1  | 4  | 10 | 1  | 60 |",
+            "| 0  | 1  | 4  | 20 | 1  | 70 |",
+            "| 1  | 2  | 5  | 30 | 2  | 80 |",
+            "| 1  | 2  | 5  | 40 | 2  | 90 |",
+            "| 2  | 2  | 6  | 30 | 2  | 80 |",
+            "| 3  | 2  | 7  | 30 | 2  | 80 |",
+            "| 2  | 2  | 6  | 40 | 2  | 90 |",
+            "| 3  | 2  | 7  | 40 | 2  | 90 |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_inner_spill_skip_key() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 1]),
+            ("b1", &vec![1, 3]),
+            ("c1", &vec![4, 5]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![2, 3]),
+            ("b1", &vec![3, 3]),
+            ("c1", &vec![6, 7]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 10]),
+            ("b2", &vec![1, 1]),
+            ("c2", &vec![50, 60]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![20, 30]),
+            ("b2", &vec![1, 2]),
+            ("c2", &vec![70, 80]),
+        );
+        let right_batch_3 = build_table_i32(
+            ("a2", &vec![20, 30]),
+            ("b2", &vec![2, 3]),
+            ("c2", &vec![70, 80]),
+        );
+        let right_batch_4 =
+            build_table_i32(("a2", &vec![40]), ("b2", &vec![3]), ("c2", &vec![90]));
+        let left = build_table_from_batches(vec![left_batch_1, left_batch_2]);
+        let right = build_table_from_batches(vec![
+            right_batch_1,
+            right_batch_2,
+            right_batch_3,
+            right_batch_4,
+        ]);
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+
+        let (_, batches) = spilled_join_collect(left, right, on, JoinType::Inner).await?;
+        let expected = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 0  | 1  | 4  | 0  | 1  | 50 |",
+            "| 0  | 1  | 4  | 10 | 1  | 60 |",
+            "| 0  | 1  | 4  | 20 | 1  | 70 |",
+            "| 1  | 3  | 5  | 30 | 3  | 80 |",
+            "| 1  | 3  | 5  | 40 | 3  | 90 |",
+            "| 2  | 3  | 6  | 30 | 3  | 80 |",
+            "| 3  | 3  | 7  | 30 | 3  | 80 |",
+            "| 2  | 3  | 6  | 40 | 3  | 90 |",
+            "| 3  | 3  | 7  | 40 | 3  | 90 |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_left_spill() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 1, 1]),
+            ("b1", &vec![1, 2, 2]),
+            ("c1", &vec![4, 5, 6]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![2, 3]),
+            ("b1", &vec![2, 3]),
+            ("c1", &vec![6, 7]),
+        );
+        let left_batch_3 = build_table_i32(
+            ("a1", &vec![4, 5]),
+            ("b1", &vec![3, 5]),
+            ("c1", &vec![8, 9]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 10]),
+            ("b2", &vec![1, 3]),
+            ("c2", &vec![50, 60]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![20, 30]),
+            ("b2", &vec![3, 4]),
+            ("c2", &vec![70, 80]),
+        );
+        let left =
+            build_table_from_batches(vec![left_batch_1, left_batch_2, left_batch_3]);
+        let right = build_table_from_batches(vec![right_batch_1, right_batch_2]);
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+
+        let (_, batches) = spilled_join_collect(left, right, on, JoinType::Left).await?;
+        let expected = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 0  | 1  | 4  | 0  | 1  | 50 |",
+            "| 1  | 2  | 5  |    |    |    |",
+            "| 1  | 2  | 6  |    |    |    |",
+            "| 2  | 2  | 6  |    |    |    |",
+            "| 3  | 3  | 7  | 10 | 3  | 60 |",
+            "| 3  | 3  | 7  | 20 | 3  | 70 |",
+            "| 4  | 3  | 8  | 10 | 3  | 60 |",
+            "| 4  | 3  | 8  | 20 | 3  | 70 |",
+            "| 5  | 5  | 9  |    |    |    |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_right_spill() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 10]),
+            ("b1", &vec![1, 3]),
+            ("c1", &vec![50, 60]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![20, 30]),
+            ("b1", &vec![3, 4]),
+            ("c1", &vec![70, 80]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 1]),
+            ("b2", &vec![1, 2]),
+            ("c2", &vec![4, 5]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![2, 3]),
+            ("b2", &vec![2, 3]),
+            ("c2", &vec![6, 7]),
+        );
+        let right_batch_3 = build_table_i32(
+            ("a2", &vec![4, 5]),
+            ("b2", &vec![3, 5]),
+            ("c2", &vec![8, 9]),
+        );
+        let left = build_table_from_batches(vec![left_batch_1, left_batch_2]);
+        let right =
+            build_table_from_batches(vec![right_batch_1, right_batch_2, right_batch_3]);
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+
+        let (_, batches) = spilled_join_collect(left, right, on, JoinType::Right).await?;
+        let expected = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 0  | 1  | 50 | 0  | 1  | 4  |",
+            "|    |    |    | 1  | 2  | 5  |",
+            "|    |    |    | 2  | 2  | 6  |",
+            "| 10 | 3  | 60 | 3  | 3  | 7  |",
+            "| 20 | 3  | 70 | 3  | 3  | 7  |",
+            "| 10 | 3  | 60 | 4  | 3  | 8  |",
+            "| 20 | 3  | 70 | 4  | 3  | 8  |",
+            "|    |    |    | 5  | 5  | 9  |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_full_spill() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 1]),
+            ("b1", &vec![1, 2]),
+            ("c1", &vec![4, 5]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![2, 3]),
+            ("b1", &vec![2, 3]),
+            ("c1", &vec![6, 7]),
+        );
+        let left_batch_3 = build_table_i32(
+            ("a1", &vec![4, 5, 6]),
+            ("b1", &vec![3, 5, 7]),
+            ("c1", &vec![8, 9, 10]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 10]),
+            ("b2", &vec![1, 3]),
+            ("c2", &vec![50, 60]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![20, 30]),
+            ("b2", &vec![3, 4]),
+            ("c2", &vec![70, 80]),
+        );
+        let right_batch_3 = build_table_i32(
+            ("a2", &vec![40, 50]),
+            ("b2", &vec![4, 5]),
+            ("c2", &vec![90, 100]),
+        );
+        let left =
+            build_table_from_batches(vec![left_batch_1, left_batch_2, left_batch_3]);
+        let right =
+            build_table_from_batches(vec![right_batch_1, right_batch_2, right_batch_3]);
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+
+        let (_, batches) = spilled_join_collect(left, right, on, JoinType::Full).await?;
+        let expected = vec![
+            "+----+----+----+----+----+-----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2  |",
+            "+----+----+----+----+----+-----+",
+            "| 0  | 1  | 4  | 0  | 1  | 50  |",
+            "| 1  | 2  | 5  |    |    |     |",
+            "| 2  | 2  | 6  |    |    |     |",
+            "| 3  | 3  | 7  | 10 | 3  | 60  |",
+            "| 3  | 3  | 7  | 20 | 3  | 70  |",
+            "| 4  | 3  | 8  | 10 | 3  | 60  |",
+            "| 4  | 3  | 8  | 20 | 3  | 70  |",
+            "|    |    |    | 30 | 4  | 80  |",
+            "|    |    |    | 40 | 4  | 90  |",
+            "| 5  | 5  | 9  | 50 | 5  | 100 |",
+            "| 6  | 7  | 10 |    |    |     |",
+            "+----+----+----+----+----+-----+",
+        ];
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_left_semi_spill() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 1]),
+            ("b1", &vec![1, 2]),
+            ("c1", &vec![4, 5]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![2, 3]),
+            ("b1", &vec![2, 3]),
+            ("c1", &vec![6, 7]),
+        );
+        let left_batch_3 = build_table_i32(
+            ("a1", &vec![4, 5]),
+            ("b1", &vec![3, 5]),
+            ("c1", &vec![8, 9]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 10]),
+            ("b2", &vec![1, 3]),
+            ("c2", &vec![50, 60]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![20, 30]),
+            ("b2", &vec![3, 4]),
+            ("c2", &vec![70, 80]),
+        );
+        let left =
+            build_table_from_batches(vec![left_batch_1, left_batch_2, left_batch_3]);
+        let right = build_table_from_batches(vec![right_batch_1, right_batch_2]);
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+
+        let (_, batches) =
+            spilled_join_collect(left, right, on, JoinType::LeftSemi).await?;
+        let expected = vec![
+            "+----+----+----+",
+            "| a1 | b1 | c1 |",
+            "+----+----+----+",
+            "| 0  | 1  | 4  |",
+            "| 3  | 3  | 7  |",
+            "| 4  | 3  | 8  |",
+            "+----+----+----+",
+        ];
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_left_anti_spill() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 1]),
+            ("b1", &vec![1, 2]),
+            ("c1", &vec![4, 5]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![2, 3]),
+            ("b1", &vec![2, 3]),
+            ("c1", &vec![6, 7]),
+        );
+        let left_batch_3 = build_table_i32(
+            ("a1", &vec![4, 5]),
+            ("b1", &vec![3, 5]),
+            ("c1", &vec![8, 9]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 10]),
+            ("b2", &vec![1, 3]),
+            ("c2", &vec![50, 60]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![20, 30]),
+            ("b2", &vec![3, 4]),
+            ("c2", &vec![70, 80]),
+        );
+        let left =
+            build_table_from_batches(vec![left_batch_1, left_batch_2, left_batch_3]);
+        let right = build_table_from_batches(vec![right_batch_1, right_batch_2]);
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+
+        let (_, batches) =
+            spilled_join_collect(left, right, on, JoinType::LeftAnti).await?;
+        let expected = vec![
+            "+----+----+----+",
+            "| a1 | b1 | c1 |",
+            "+----+----+----+",
+            "| 1  | 2  | 5  |",
+            "| 2  | 2  | 6  |",
+            "| 5  | 5  | 9  |",
+            "+----+----+----+",
+        ];
+        assert_batches_eq!(expected, &batches);
 
         Ok(())
     }

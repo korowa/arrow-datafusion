@@ -78,7 +78,11 @@ impl MemoryPool for GreedyMemoryPool {
                 (new_used <= self.pool_size).then_some(new_used)
             })
             .map_err(|used| {
-                insufficient_capacity_err(reservation, additional, self.pool_size - used)
+                insufficient_capacity_err(
+                    reservation,
+                    additional,
+                    self.pool_size.saturating_sub(used),
+                )
             })?;
         Ok(())
     }

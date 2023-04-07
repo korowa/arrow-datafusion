@@ -150,10 +150,9 @@ async fn merge_join() {
         .set_bool("datafusion.optimizer.prefer_hash_join", false);
 
     run_limit_test_with_config(
-        "select t1.* from t t1 JOIN t t2 ON t1.pod = t2.pod AND t1.time = t2.time",
+        "select t1.* from t t1 JOIN t t2 ON t1.host_string = t2.host_string",
         vec![
-            "Resources exhausted: Failed to allocate additional",
-            "SMJStream",
+            "Resources exhausted: Memory Exhausted while SortMergeJoin (DiskManager is disabled)",
         ],
         1_000,
         config,
