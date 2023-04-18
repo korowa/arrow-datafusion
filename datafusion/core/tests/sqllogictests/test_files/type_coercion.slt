@@ -5,9 +5,9 @@
 # to you under the Apache License, Version 2.0 (the
 # "License"); you may not use this file except in compliance
 # with the License.  You may obtain a copy of the License at
-#
+
 #   http://www.apache.org/licenses/LICENSE-2.0
-#
+
 # Unless required by applicable law or agreed to in writing,
 # software distributed under the License is distributed on an
 # "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
@@ -15,21 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "gen"
-description = "Code generation for proto"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.62"
-authors = ["Apache Arrow <dev@arrow.apache.org>"]
-homepage = "https://github.com/apache/arrow-datafusion"
-repository = "https://github.com/apache/arrow-datafusion"
-license = "Apache-2.0"
-publish = false
+##########
+## Test type coercion
+##########
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# test utf8 and large utf8
+query B
+select 's' is distinct from arrow_cast('s', 'LargeUtf8');
+----
+false
 
-[dependencies]
-# Pin these dependencies so that the generated output is deterministic
-pbjson-build = { version = "=0.5.1" }
-prost-build = { version = "=0.11.9" }
+query B
+select 's' is not distinct from arrow_cast('s', 'LargeUtf8');
+----
+true
