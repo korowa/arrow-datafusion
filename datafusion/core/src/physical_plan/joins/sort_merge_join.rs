@@ -477,6 +477,7 @@ enum BufferedState {
     Exhausted,
 }
 
+#[derive(Debug)]
 struct StreamedJoinedChunk {
     /// Index of batch buffered_data
     buffered_batch_idx: Option<usize>,
@@ -759,6 +760,11 @@ impl Stream for SMJStream {
                     else if buffer_has_next_spill {
                         self.freeze_all()?;
                         self.buffered_data.fetch_next_spill()?;
+                        if self.buffered_data.scanning_batch_finished() {
+                            self.buffered_data.spill_reset()?;
+                            self.state = SMJState::Init;
+                            continue;
+                        }
                         self.streamed_batch.scanning_reset();
                     }
                     // If stream-side not in range and all spills are read - reset spills
@@ -919,6 +925,13 @@ impl SMJStream {
                     }
                 },
                 BufferedState::PollingRest => {
+                    // Do not propagate range if batch starts with new join key
+                    if self.buffered_data.tail_batch().range.end == 0 {
+                        self.buffered_data.prepare_for_scanning()?;
+                        self.buffered_state = BufferedState::Ready;
+                        return Poll::Ready(Some(Ok(())));
+                    }
+
                     if self.buffered_data.tail_batch().range.end
                         < self.buffered_data.tail_batch().batch.num_rows()
                     {
@@ -1242,7 +1255,18 @@ impl BufferedData {
     }
 
     fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
-        let buffered_batch = BufferedBatch::new(batch, 0..0, &self.join_key);
+        let mut buffered_batch = BufferedBatch::new(batch, 0..0, &self.join_key);
+
+        if self.batches.is_empty() || 
+            is_join_arrays_equal(
+                &self.head_batch().join_arrays,
+                self.head_batch().range.start,
+                &buffered_batch.join_arrays,
+                buffered_batch.range.end,
+            )?
+        {
+            buffered_batch.range.end = 1;
+        }
 
         if self
             .reservation
@@ -1394,7 +1418,7 @@ impl BufferedData {
     }
 
     pub fn scanning_batch_finished(&self) -> bool {
-        self.scanning_offset == self.scanning_batch().range.len()
+        self.scanning_offset >= self.scanning_batch().range.len()
     }
 
     pub fn scanning_finished(&self) -> bool {
@@ -2580,7 +2604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_inner_spill_single_key() -> Result<()> {
+    async fn join_inner_spill_single_key_value() -> Result<()> {
         let left_batch_1 = build_table_i32(
             ("a1", &vec![0, 1]),
             ("b1", &vec![1, 1]),
@@ -2644,7 +2668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_inner_spill_multiple_keys() -> Result<()> {
+    async fn join_inner_spill_multiple_key_values() -> Result<()> {
         let left_batch_1 = build_table_i32(
             ("a1", &vec![0, 1]),
             ("b1", &vec![1, 2]),
@@ -2667,9 +2691,11 @@ mod tests {
         );
         let right_batch_3 =
             build_table_i32(("a2", &vec![40]), ("b2", &vec![2]), ("c2", &vec![90]));
+        let right_batch_4 =
+            build_table_i32(("a2", &vec![50]), ("b2", &vec![3]), ("c2", &vec![100]));
         let left = build_table_from_batches(vec![left_batch_1, left_batch_2]);
         let right =
-            build_table_from_batches(vec![right_batch_1, right_batch_2, right_batch_3]);
+            build_table_from_batches(vec![right_batch_1, right_batch_2, right_batch_3, right_batch_4]);
         let on = vec![(
             Column::new_with_schema("b1", &left.schema())?,
             Column::new_with_schema("b2", &right.schema())?,
@@ -2689,6 +2715,60 @@ mod tests {
             "| 3  | 2  | 7  | 30 | 2  | 80 |",
             "| 2  | 2  | 6  | 40 | 2  | 90 |",
             "| 3  | 2  | 7  | 40 | 2  | 90 |",
+            "+----+----+----+----+----+----+",
+        ];
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_inner_spill_multiple_keys() -> Result<()> {
+        let left_batch_1 = build_table_i32(
+            ("a1", &vec![0, 0, 1]),
+            ("b1", &vec![1, 2, 1]),
+            ("c1", &vec![4, 5, 5]),
+        );
+        let left_batch_2 = build_table_i32(
+            ("a1", &vec![2, 3]),
+            ("b1", &vec![2, 2]),
+            ("c1", &vec![6, 7]),
+        );
+        let right_batch_1 = build_table_i32(
+            ("a2", &vec![0, 1]),
+            ("b2", &vec![1, 1]),
+            ("c2", &vec![10, 20]),
+        );
+        let right_batch_2 = build_table_i32(
+            ("a2", &vec![1, 2, 3]),
+            ("b2", &vec![1, 1, 2]),
+            ("c2", &vec![30, 40, 50]),
+        );
+        let right_batch_3 =
+            build_table_i32(("a2", &vec![4]), ("b2", &vec![3]), ("c2", &vec![60]));
+        let left = build_table_from_batches(vec![left_batch_1, left_batch_2]);
+        let right =
+            build_table_from_batches(vec![right_batch_1, right_batch_2, right_batch_3]);
+        let on = vec![
+            (
+                Column::new_with_schema("a1", &left.schema())?,
+                Column::new_with_schema("a2", &right.schema())?,
+            ),
+            (
+                Column::new_with_schema("b1", &left.schema())?,
+                Column::new_with_schema("b2", &right.schema())?,
+            ),
+        ];
+
+        let (_, batches) = spilled_join_collect(left, right, on, JoinType::Inner).await?;
+        let expected = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 0  | 1  | 4  | 0  | 1  | 10 |",
+            "| 1  | 1  | 5  | 1  | 1  | 20 |",
+            "| 1  | 1  | 5  | 1  | 1  | 30 |",
+            "| 3  | 2  | 7  | 3  | 2  | 50 |",
             "+----+----+----+----+----+----+",
         ];
         assert_batches_eq!(expected, &batches);

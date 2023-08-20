@@ -29,6 +29,7 @@ use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoi
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion_expr::JoinType;
 
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeConfig};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use test_utils::stagger_batch_with_seed;
 
@@ -159,22 +160,71 @@ async fn run_join_test(
         );
         let hj_collected = collect(hj, task_ctx.clone()).await.unwrap();
 
+        // spilling sort-merge join
+        let spill_runtime_config = RuntimeConfig::new().with_memory_limit(0, 1.0);
+        let spill_runtime = Arc::new(RuntimeEnv::new(spill_runtime_config).unwrap());
+        let spill_session_config = SessionConfig::new().with_batch_size(batch_size);
+        let spill_session_ctx = SessionContext::with_config_rt(spill_session_config, spill_runtime);
+        let spill_task_ctx = spill_session_ctx.task_ctx();
+        let left = Arc::new(
+            MemoryExec::try_new(&[input1.clone()], schema1.clone(), None).unwrap(),
+        );
+        let right = Arc::new(
+            MemoryExec::try_new(&[input2.clone()], schema2.clone(), None).unwrap(),
+        );
+        let ssmj = Arc::new(
+            SortMergeJoinExec::try_new(
+                left,
+                right,
+                on_columns.clone(),
+                join_type,
+                vec![SortOptions::default(), SortOptions::default()],
+                false,
+            )
+            .unwrap(),
+        );
+        let ssmj_collected = collect(ssmj, spill_task_ctx.clone()).await.unwrap();
+
         // compare
         let smj_formatted = pretty_format_batches(&smj_collected).unwrap().to_string();
         let hj_formatted = pretty_format_batches(&hj_collected).unwrap().to_string();
+        let ssmj_formatted = pretty_format_batches(&ssmj_collected).unwrap().to_string();
 
         let mut smj_formatted_sorted: Vec<&str> = smj_formatted.trim().lines().collect();
         smj_formatted_sorted.sort_unstable();
 
+        // for l in smj_formatted_sorted.iter() {
+        //     println!("{}", l);
+        // }
+
         let mut hj_formatted_sorted: Vec<&str> = hj_formatted.trim().lines().collect();
         hj_formatted_sorted.sort_unstable();
 
+        let mut ssmj_formatted_sorted: Vec<&str> = ssmj_formatted.trim().lines().collect();
+        ssmj_formatted_sorted.sort_unstable();
+
+        // println!("-----------------------------------------------------------------");
+
+        // for l in ssmj_formatted_sorted.iter() {
+        //     println!("{}", l);
+        // }
+
+        // Compare smj vs hj results
         for (i, (smj_line, hj_line)) in smj_formatted_sorted
             .iter()
             .zip(&hj_formatted_sorted)
             .enumerate()
         {
             assert_eq!((i, smj_line), (i, hj_line));
+        }
+
+        // Compare smj vs spilled smj results
+        for (i, (smj_line, ssmj_line)) in smj_formatted_sorted
+            .iter()
+            .zip(&ssmj_formatted_sorted)
+            .enumerate()
+        {
+            assert_eq!((i, smj_line), (i, ssmj_line));
         }
     }
 }
