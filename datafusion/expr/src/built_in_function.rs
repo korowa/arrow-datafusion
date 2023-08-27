@@ -168,6 +168,8 @@ pub enum BuiltinScalarFunction {
     ArrayReplaceAll,
     /// array_slice
     ArraySlice,
+    /// array_sort
+    ArraySort,
     /// array_to_string
     ArrayToString,
     /// cardinality
@@ -385,6 +387,7 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::ArrayReplaceAll => Volatility::Immutable,
             BuiltinScalarFunction::Flatten => Volatility::Immutable,
             BuiltinScalarFunction::ArraySlice => Volatility::Immutable,
+            BuiltinScalarFunction::ArraySort => Volatility::Immutable,
             BuiltinScalarFunction::ArrayToString => Volatility::Immutable,
             BuiltinScalarFunction::Cardinality => Volatility::Immutable,
             BuiltinScalarFunction::MakeArray => Volatility::Immutable,
@@ -573,6 +576,7 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::ArrayReplaceN => Ok(input_expr_types[0].clone()),
             BuiltinScalarFunction::ArrayReplaceAll => Ok(input_expr_types[0].clone()),
             BuiltinScalarFunction::ArraySlice => Ok(input_expr_types[0].clone()),
+            BuiltinScalarFunction::ArraySort => Ok(input_expr_types[0].clone()),
             BuiltinScalarFunction::ArrayToString => Ok(Utf8),
             BuiltinScalarFunction::Cardinality => Ok(UInt64),
             BuiltinScalarFunction::MakeArray => match input_expr_types.len() {
@@ -857,6 +861,7 @@ impl BuiltinScalarFunction {
                 Signature::any(3, self.volatility())
             }
             BuiltinScalarFunction::ArraySlice => Signature::any(3, self.volatility()),
+            BuiltinScalarFunction::ArraySort => Signature::any(1, self.volatility()),
             BuiltinScalarFunction::ArrayToString => {
                 Signature::variadic_any(self.volatility())
             }
@@ -1362,6 +1367,7 @@ fn aliases(func: &BuiltinScalarFunction) -> &'static [&'static str] {
             &["array_replace_all", "list_replace_all"]
         }
         BuiltinScalarFunction::ArraySlice => &["array_slice", "list_slice"],
+        BuiltinScalarFunction::ArraySort => &["array_sort", "list_sort"],
         BuiltinScalarFunction::ArrayToString => &[
             "array_to_string",
             "list_to_string",

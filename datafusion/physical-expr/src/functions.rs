@@ -488,6 +488,7 @@ pub fn create_physical_fun(
         BuiltinScalarFunction::ArraySlice => {
             Arc::new(|args| make_scalar_function(array_expressions::array_slice)(args))
         }
+        BuiltinScalarFunction::ArraySort => Arc::new(|args| make_scalar_function(array_expressions::array_sort)(args)),
         BuiltinScalarFunction::ArrayToString => Arc::new(|args| {
             make_scalar_function(array_expressions::array_to_string)(args)
         }),

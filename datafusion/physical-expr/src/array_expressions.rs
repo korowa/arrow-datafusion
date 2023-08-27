@@ -22,6 +22,7 @@ use arrow::buffer::{Buffer, OffsetBuffer};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, UInt64Type};
 use arrow_buffer::NullBuffer;
+use arrow_schema::SortOptions;
 use core::any::type_name;
 use datafusion_common::cast::{as_generic_string_array, as_int64_array, as_list_array};
 use datafusion_common::{exec_err, internal_err, not_impl_err, plan_err, ScalarValue};
@@ -1862,6 +1863,21 @@ pub fn array_has_all(args: &[ArrayRef]) -> Result<ArrayRef> {
         }
     }
     Ok(Arc::new(boolean_builder.finish()))
+}
+
+/// array_sort SQL function
+pub fn array_sort(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let list_array = as_list_array(&args[0])?;
+    let result = list_array.iter()
+        .map(|list| {
+            match list {
+                Some(values) => Ok(Some(compute::sort(&values, None)?)),
+                None => Ok(None),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let v = ListArray::from_iter_primitive(result);
+    Ok(args[0].clone())
 }
 
 #[cfg(test)]

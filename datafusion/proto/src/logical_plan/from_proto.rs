@@ -476,6 +476,7 @@ impl From<&protobuf::ScalarFunction> for BuiltinScalarFunction {
             ScalarFunction::ArrayReplaceN => Self::ArrayReplaceN,
             ScalarFunction::ArrayReplaceAll => Self::ArrayReplaceAll,
             ScalarFunction::ArraySlice => Self::ArraySlice,
+            ScalarFunction::ArraySort => Self::ArraySort,
             ScalarFunction::ArrayToString => Self::ArrayToString,
             ScalarFunction::Cardinality => Self::Cardinality,
             ScalarFunction::Array => Self::MakeArray,
