@@ -472,19 +472,13 @@ impl FileOpener for ParquetOpener {
                     builder.metadata(),
                     reorder_predicates,
                     &file_metrics,
-                );
+                )?;
 
                 match row_filter {
-                    Ok(Some(filter)) => {
+                    Some(filter) => {
                         builder = builder.with_row_filter(filter);
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        debug!(
-                            "Ignoring error building row filter for '{:?}': {}",
-                            predicate, e
-                        );
-                    }
+                    None => {}
                 };
             };
 

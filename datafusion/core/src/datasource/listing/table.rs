@@ -777,7 +777,12 @@ impl TableProvider for ListingTable {
         &self,
         filter: &Expr,
     ) -> Result<TableProviderFilterPushDown> {
-        if expr_applicable_for_cols(
+        let table_based_filter = expr_applicable_for_cols(
+            &self.table_schema.fields().into_iter().map(|x| x.name().clone()).collect::<Vec<_>>(),
+            filter,
+        );
+
+        let partition_column_based_filter = expr_applicable_for_cols(
             &self
                 .options
                 .table_partition_cols
@@ -785,10 +790,20 @@ impl TableProvider for ListingTable {
                 .map(|x| x.0.clone())
                 .collect::<Vec<_>>(),
             filter,
-        ) {
+        );
+
+        if let Some(_) = self.options.format.as_any().downcast_ref::<ParquetFormat>() {
+            if table_based_filter {
+                return Ok(TableProviderFilterPushDown::Exact);
+            }
+        }
+
+        if partition_column_based_filter
+        {
             // if filter can be handled by partiton pruning, it is exact
             Ok(TableProviderFilterPushDown::Exact)
-        } else {
+        }
+        else {
             // otherwise, we still might be able to handle the filter with file
             // level mechanisms such as Parquet row group pruning.
             Ok(TableProviderFilterPushDown::Inexact)
