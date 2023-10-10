@@ -33,9 +33,9 @@ use std::task::{Context, Poll};
 use crate::physical_plan::expressions::Column;
 use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::joins::utils::{
-    build_join_schema, calculate_join_output_ordering, check_join_is_valid,
+    null_preserving_apply_join_filter_to_indices, build_join_schema, calculate_join_output_ordering, check_join_is_valid,
     combine_join_equivalence_properties, combine_join_ordering_equivalence_properties,
-    estimate_join_statistics, partitioned_join_output_partitioning, JoinOn, JoinSide,
+    estimate_join_statistics, partitioned_join_output_partitioning, JoinFilter, JoinOn, JoinSide,
 };
 use crate::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::physical_plan::{
@@ -68,6 +68,8 @@ pub struct SortMergeJoinExec {
     pub(crate) right: Arc<dyn ExecutionPlan>,
     /// Set of common columns used to join on
     pub(crate) on: JoinOn,
+    /// Filters which are applied while finding matching rows
+    pub(crate) filter: Option<JoinFilter>,
     /// How the join is performed
     pub(crate) join_type: JoinType,
     /// The schema once the join is applied
@@ -95,6 +97,7 @@ impl SortMergeJoinExec {
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
         on: JoinOn,
+        filter: Option<JoinFilter>,
         join_type: JoinType,
         sort_options: Vec<SortOptions>,
         null_equals_null: bool,
@@ -150,6 +153,7 @@ impl SortMergeJoinExec {
             left,
             right,
             on,
+            filter,
             join_type,
             schema,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -175,6 +179,23 @@ impl SortMergeJoinExec {
             | JoinType::Full
             | JoinType::LeftAnti
             | JoinType::LeftSemi => JoinSide::Left,
+        }
+    }
+
+    /// Get build side (e.g streaming side) information for this sort merge join.
+    /// In current implementation, build side is determined according to join type.
+    pub fn build_side(join_type: &JoinType) -> JoinSide {
+        // When output schema contains only the right side, probe side is right.
+        // Otherwise probe side is the left side.
+        match join_type {
+            JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
+                JoinSide::Left
+            }
+            JoinType::Inner
+            | JoinType::Left
+            | JoinType::Full
+            | JoinType::LeftAnti
+            | JoinType::LeftSemi => JoinSide::Right,
         }
     }
 
@@ -309,6 +330,7 @@ impl ExecutionPlan for SortMergeJoinExec {
                 left.clone(),
                 right.clone(),
                 self.on.clone(),
+                self.filter.clone(),
                 self.join_type,
                 self.sort_options.clone(),
                 self.null_equals_null,
@@ -358,6 +380,7 @@ impl ExecutionPlan for SortMergeJoinExec {
             buffered,
             on_streamed,
             on_buffered,
+            self.filter.clone(),
             self.join_type,
             batch_size,
             SortMergeJoinMetrics::new(partition, &self.metrics),
@@ -614,6 +637,8 @@ struct SMJStream {
     pub on_streamed: Vec<Column>,
     /// Join key columns of buffered
     pub on_buffered: Vec<Column>,
+    /// Join filter
+    filter: Option<JoinFilter>,
     /// Staging output array builders
     pub output_record_batches: Vec<RecordBatch>,
     /// Staging output size, including output batches and staging joined results
@@ -740,6 +765,7 @@ impl SMJStream {
         buffered: SendableRecordBatchStream,
         on_streamed: Vec<Column>,
         on_buffered: Vec<Column>,
+        filter: Option<JoinFilter>,
         join_type: JoinType,
         batch_size: usize,
         join_metrics: SortMergeJoinMetrics,
@@ -765,6 +791,7 @@ impl SMJStream {
             current_ordering: Ordering::Equal,
             on_streamed,
             on_buffered,
+            filter,
             output_record_batches: vec![],
             output_size: 0,
             batch_size,
@@ -1092,6 +1119,23 @@ impl SMJStream {
     fn freeze_streamed(&mut self) -> Result<()> {
         for chunk in self.streamed_batch.output_indices.iter_mut() {
             let streamed_indices = chunk.streamed_indices.finish();
+            let buffered_indices = chunk.buffered_indices.finish();
+
+            let (buffered_indices, streamed_indices) = if self.filter.is_some() && chunk.buffered_batch_idx.is_some() {
+                let filter = self.filter.clone().unwrap();
+                let buffered_idx = chunk.buffered_batch_idx.unwrap();
+                null_preserving_apply_join_filter_to_indices(
+                    &self.buffered_data.batches[buffered_idx].batch,
+                    &self.streamed_batch.batch,
+                    buffered_indices,
+                    streamed_indices,
+                    &filter,
+                    SortMergeJoinExec::build_side(&self.join_type),
+                )?
+            } else {
+                (buffered_indices, streamed_indices)
+            };
+            
 
             if streamed_indices.is_empty() {
                 continue;
@@ -1104,8 +1148,6 @@ impl SMJStream {
                 .iter()
                 .map(|column| take(column, &streamed_indices, None))
                 .collect::<Result<Vec<_>, ArrowError>>()?;
-
-            let buffered_indices: UInt64Array = chunk.buffered_indices.finish();
 
             let mut buffered_columns =
                 if matches!(self.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
@@ -1393,8 +1435,10 @@ mod tests {
     use datafusion_execution::TaskContext;
 
     use crate::common::assert_contains;
+    use crate::logical_expr::Operator;
+    use crate::physical_expr::{expressions::BinaryExpr, PhysicalExpr};
     use crate::physical_plan::expressions::Column;
-    use crate::physical_plan::joins::utils::JoinOn;
+    use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinOn, JoinSide};
     use crate::physical_plan::joins::SortMergeJoinExec;
     use crate::physical_plan::memory::MemoryExec;
     use crate::physical_plan::{common, ExecutionPlan};
@@ -1499,13 +1543,14 @@ mod tests {
         join_type: JoinType,
     ) -> Result<SortMergeJoinExec> {
         let sort_options = vec![SortOptions::default(); on.len()];
-        SortMergeJoinExec::try_new(left, right, on, join_type, sort_options, false)
+        SortMergeJoinExec::try_new(left, right, on, None, join_type, sort_options, false)
     }
 
     fn join_with_options(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
         on: JoinOn,
+        filter: Option<JoinFilter>,
         join_type: JoinType,
         sort_options: Vec<SortOptions>,
         null_equals_null: bool,
@@ -1514,6 +1559,7 @@ mod tests {
             left,
             right,
             on,
+            filter,
             join_type,
             sort_options,
             null_equals_null,
@@ -1527,13 +1573,25 @@ mod tests {
         join_type: JoinType,
     ) -> Result<(Vec<String>, Vec<RecordBatch>)> {
         let sort_options = vec![SortOptions::default(); on.len()];
-        join_collect_with_options(left, right, on, join_type, sort_options, false).await
+        join_collect_with_options(left, right, on, None, join_type, sort_options, false).await
+    }
+
+    async fn join_collect_with_filter(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        on: JoinOn,
+        filter: JoinFilter,
+        join_type: JoinType,
+    ) -> Result<(Vec<String>, Vec<RecordBatch>)> {
+        let sort_options = vec![SortOptions::default(); on.len()];
+        join_collect_with_options(left, right, on, Some(filter), join_type, sort_options, false).await
     }
 
     async fn join_collect_with_options(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
         on: JoinOn,
+        filter: Option<JoinFilter>,
         join_type: JoinType,
         sort_options: Vec<SortOptions>,
         null_equals_null: bool,
@@ -1543,6 +1601,7 @@ mod tests {
             left,
             right,
             on,
+            filter,
             join_type,
             sort_options,
             null_equals_null,
@@ -1569,6 +1628,30 @@ mod tests {
         let stream = join.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
         Ok((columns, batches))
+    }
+
+    fn prepare_join_filter() -> JoinFilter {
+        let column_indices = vec![
+            ColumnIndex {
+                index: 2,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 2,
+                side: JoinSide::Right,
+            },
+        ];
+        let intermediate_schema = Schema::new(vec![
+            Field::new("c1", DataType::Int32, true),
+            Field::new("c2", DataType::Int32, true),
+        ]);
+        let filter_expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("c1", 0)),
+            Operator::Gt,
+            Arc::new(Column::new("c2", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+
+        JoinFilter::new(filter_expression, column_indices, intermediate_schema)
     }
 
     #[tokio::test]
@@ -1746,6 +1829,7 @@ mod tests {
             left,
             right,
             on,
+            None,
             JoinType::Inner,
             vec![
                 SortOptions {
@@ -2327,6 +2411,7 @@ mod tests {
                 left.clone(),
                 right.clone(),
                 on.clone(),
+                None,
                 join_type,
                 sort_options.clone(),
                 false,
@@ -2405,6 +2490,7 @@ mod tests {
                 left.clone(),
                 right.clone(),
                 on.clone(),
+                None,
                 join_type,
                 sort_options.clone(),
                 false,
@@ -2420,6 +2506,154 @@ mod tests {
             assert_contains!(err.to_string(), "SMJStream[0]");
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_inner_with_filter() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 5]),
+            ("c1", &vec![7, 8, 9]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30]),
+            ("b2", &vec![4, 5, 5]),
+            ("c2", &vec![6, 7, 8]),
+        );
+
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+        let filter = prepare_join_filter();
+
+        let (_, batches) = join_collect_with_filter(left, right, on, filter, JoinType::Inner).await?;
+
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 7  | 10 | 4  | 6  |",
+            "| 2  | 5  | 8  | 20 | 5  | 7  |",
+            "| 3  | 5  | 9  | 20 | 5  | 7  |",
+            "| 3  | 5  | 9  | 30 | 5  | 8  |",
+            "+----+----+----+----+----+----+",
+        ];
+        // The output order is important as SMJ preserves sortedness
+        assert_batches_eq!(expected, &batches);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_left_with_filter() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![4, 5, 7, 8]),
+            ("b1", &vec![0, 1, 2, 2]),
+            ("c1", &vec![7, 8, 9, 1]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b2", &vec![2, 2, 3, 4]),
+            ("c2", &vec![7, 5, 6, 4]),
+        );
+
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+        let filter = prepare_join_filter();
+
+        let (_, batches) = join_collect_with_filter(left, right, on, filter, JoinType::Left).await?;
+
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 4  | 0  | 7  |    |    |    |",
+            "| 5  | 1  | 8  |    |    |    |",
+            "| 7  | 2  | 9  | 10 | 2  | 7  |",
+            "| 7  | 2  | 9  | 20 | 2  | 5  |",
+            "| 8  | 2  | 1  |    |    |    |",
+            "+----+----+----+----+----+----+",
+        ];
+        // The output order is important as SMJ preserves sortedness
+        assert_batches_eq!(expected, &batches);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_right_with_filter() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![4, 5, 7, 8]),
+            ("b1", &vec![0, 1, 2, 2]),
+            ("c1", &vec![7, 8, 9, 1]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b2", &vec![2, 2, 3, 4]),
+            ("c2", &vec![7, 5, 6, 4]),
+        );
+
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+        let filter = prepare_join_filter();
+
+        let (_, batches) = join_collect_with_filter(left, right, on, filter, JoinType::Right).await?;
+
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 7  | 2  | 9  | 10 | 2  | 7  |",
+            "| 7  | 2  | 9  | 20 | 2  | 5  |",
+            "|    |    |    | 30 | 3  | 6  |",
+            "|    |    |    | 40 | 4  | 4  |",
+            "+----+----+----+----+----+----+",
+        ];
+        // The output order is important as SMJ preserves sortedness
+        assert_batches_eq!(expected, &batches);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_full_with_filter() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![4, 5, 7, 8]),
+            ("b1", &vec![0, 1, 2, 2]),
+            ("c1", &vec![7, 8, 9, 1]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b2", &vec![2, 2, 3, 4]),
+            ("c2", &vec![7, 5, 6, 4]),
+        );
+
+        let on = vec![(
+            Column::new_with_schema("b1", &left.schema())?,
+            Column::new_with_schema("b2", &right.schema())?,
+        )];
+        let filter = prepare_join_filter();
+
+        let (_, batches) = join_collect_with_filter(left, right, on, filter, JoinType::Full).await?;
+
+        let expected = [
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 4  | 0  | 7  |    |    |    |",
+            "| 5  | 1  | 8  |    |    |    |",
+            "| 7  | 2  | 9  | 10 | 2  | 7  |",
+            "| 7  | 2  | 9  | 20 | 2  | 5  |",
+            "| 8  | 2  | 1  |    |    |    |",
+            "|    |    |    | 30 | 3  | 6  |",
+            "|    |    |    | 40 | 4  | 4  |",
+            "+----+----+----+----+----+----+",
+        ];
+        // The output order is important as SMJ preserves sortedness
+        assert_batches_eq!(expected, &batches);
         Ok(())
     }
 }

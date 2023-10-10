@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::usize;
 
+use crate::physical_optimizer::test_utils::filter_exec;
 use crate::physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
 use crate::physical_plan::SchemaRef;
 use crate::physical_plan::{
@@ -38,6 +39,7 @@ use arrow::array::{
 use arrow::compute;
 use arrow::datatypes::{Field, Schema, SchemaBuilder};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow_array::{PrimitiveArray, ArrowNumericType};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
@@ -1081,14 +1083,18 @@ pub(crate) fn get_final_indices_from_bit_map(
     (left_indices, right_indices)
 }
 
-pub(crate) fn apply_join_filter_to_indices(
+pub(crate) fn apply_join_filter_to_indices<BuildIdxType, ProbeIdxType>(
     build_input_buffer: &RecordBatch,
     probe_batch: &RecordBatch,
-    build_indices: UInt64Array,
-    probe_indices: UInt32Array,
+    build_indices: PrimitiveArray<BuildIdxType>,
+    probe_indices: PrimitiveArray<ProbeIdxType>,
     filter: &JoinFilter,
     build_side: JoinSide,
-) -> Result<(UInt64Array, UInt32Array)> {
+) -> Result<(PrimitiveArray<BuildIdxType>, PrimitiveArray<ProbeIdxType>)>
+where
+    BuildIdxType: ArrowNumericType,
+    ProbeIdxType: ArrowNumericType,
+{
     if build_indices.is_empty() && probe_indices.is_empty() {
         return Ok((build_indices, probe_indices));
     };
@@ -1116,17 +1122,68 @@ pub(crate) fn apply_join_filter_to_indices(
     ))
 }
 
+pub(crate) fn null_preserving_apply_join_filter_to_indices<BuildIdxType, ProbeIdxType>(
+    build_input_buffer: &RecordBatch,
+    probe_batch: &RecordBatch,
+    build_indices: PrimitiveArray<BuildIdxType>,
+    probe_indices: PrimitiveArray<ProbeIdxType>,
+    filter: &JoinFilter,
+    build_side: JoinSide,
+) -> Result<(PrimitiveArray<BuildIdxType>, PrimitiveArray<ProbeIdxType>)>
+where
+    BuildIdxType: ArrowNumericType,
+    ProbeIdxType: ArrowNumericType,
+{
+    if build_indices.is_empty() && probe_indices.is_empty() {
+        return Ok((build_indices, probe_indices));
+    };
+
+    let intermediate_batch = build_batch_from_indices(
+        filter.schema(),
+        build_input_buffer,
+        probe_batch,
+        &build_indices,
+        &probe_indices,
+        filter.column_indices(),
+        build_side,
+    )?;
+
+    let probe_output_mask = compute::is_null(&build_indices)?;
+
+    let filter_result = filter
+        .expression()
+        .evaluate(&intermediate_batch)?
+        .into_array(intermediate_batch.num_rows());
+    let filter_result = as_boolean_array(&filter_result)?;
+    let mask = compute::or_kleene(&probe_output_mask, filter_result)?;
+
+    println!("outer: {:?}", probe_output_mask);
+    println!("filter: {:?}", filter_result);
+    println!("mask: {:?}", mask);
+
+    let left_filtered = compute::filter(&build_indices, &mask)?;
+    let right_filtered = compute::filter(&probe_indices, &mask)?;
+    Ok((
+        downcast_array(left_filtered.as_ref()),
+        downcast_array(right_filtered.as_ref()),
+    ))
+}
+
 /// Returns a new [RecordBatch] by combining the `left` and `right` according to `indices`.
 /// The resulting batch has [Schema] `schema`.
-pub(crate) fn build_batch_from_indices(
+pub(crate) fn build_batch_from_indices<BuildIdxType, ProbeIdxType>(
     schema: &Schema,
     build_input_buffer: &RecordBatch,
     probe_batch: &RecordBatch,
-    build_indices: &UInt64Array,
-    probe_indices: &UInt32Array,
+    build_indices: &PrimitiveArray<BuildIdxType>,
+    probe_indices: &PrimitiveArray<ProbeIdxType>,
     column_indices: &[ColumnIndex],
     build_side: JoinSide,
-) -> Result<RecordBatch> {
+) -> Result<RecordBatch>
+where
+    BuildIdxType: ArrowNumericType,
+    ProbeIdxType: ArrowNumericType,
+{
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new()
             .with_match_field_names(true)

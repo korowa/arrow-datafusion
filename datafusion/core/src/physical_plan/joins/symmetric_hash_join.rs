@@ -62,7 +62,7 @@ use crate::physical_plan::{
 
 use arrow::array::{ArrowPrimitiveType, NativeAdapter, PrimitiveArray, PrimitiveBuilder};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{Schema, SchemaRef, UInt32Type, UInt64Type};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::utils::bisect;
 use datafusion_common::{internal_err, plan_err, JoinType};
@@ -766,7 +766,7 @@ pub(crate) fn build_side_determined_results(
     // Check if we need to produce a result in the final output:
     if need_to_produce_result_in_final(build_hash_joiner.build_side, join_type) {
         // Calculate the indices for build and probe sides based on join type and build side:
-        let (build_indices, probe_indices) = calculate_indices_by_join_type(
+        let (build_indices, probe_indices) = calculate_indices_by_join_type::<UInt32Type, UInt64Type>(
             build_hash_joiner.build_side,
             prune_length,
             &build_hash_joiner.visited_rows,
