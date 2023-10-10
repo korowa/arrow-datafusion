@@ -94,6 +94,7 @@ Here are some active projects using DataFusion:
 
  <!-- "Active" means github repositories that had at least one commit in the last 6 months -->
 
+- [Arroyo](https://github.com/ArroyoSystems/arroyo) Distributed stream processing engine in Rust
 - [Ballista](https://github.com/apache/arrow-ballista) Distributed SQL Query Engine
 - [CeresDB](https://github.com/CeresDB/ceresdb) Distributed Time-Series Database
 - [CnosDB](https://github.com/cnosdb/cnosdb) Open Source Distributed Time Series Database
@@ -105,9 +106,11 @@ Here are some active projects using DataFusion:
 - [GlareDB](https://github.com/GlareDB/glaredb) Fast SQL database for querying and analyzing distributed data.
 - [InfluxDB IOx](https://github.com/influxdata/influxdb_iox) Time Series Database
 - [Kamu](https://github.com/kamu-data/kamu-cli/) Planet-scale streaming data pipeline
+- [Lance](https://github.com/lancedb/lance) Modern columnar data format for ML
 - [Parseable](https://github.com/parseablehq/parseable) Log storage and observability platform
 - [qv](https://github.com/timvw/qv) Quickly view your data
 - [bdt](https://github.com/andygrove/bdt) Boring Data Tool
+- [Restate](https://github.com/restatedev) Easily build resilient applications using distributed durable async/await
 - [ROAPI](https://github.com/roapi/roapi)
 - [Seafowl](https://github.com/splitgraph/seafowl) CDN-friendly analytical database
 - [Synnada](https://synnada.ai/) Streaming-first framework for data products

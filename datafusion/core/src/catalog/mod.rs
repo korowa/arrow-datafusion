@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 /// Represent a list of named catalogs
 pub trait CatalogList: Sync + Send {
-    /// Returns the catalog list as [`Any`](std::any::Any)
+    /// Returns the catalog list as [`Any`]
     /// so that it can be downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 
@@ -101,7 +101,7 @@ impl Default for MemoryCatalogProvider {
 
 /// Represents a catalog, comprising a number of named schemas.
 pub trait CatalogProvider: Sync + Send {
-    /// Returns the catalog provider as [`Any`](std::any::Any)
+    /// Returns the catalog provider as [`Any`]
     /// so that it can be downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 
@@ -237,7 +237,7 @@ mod tests {
 
         match catalog.register_schema("foo", schema) {
             Ok(_) => panic!("unexpected OK"),
-            Err(e) => assert_eq!(e.to_string(), "This feature is not implemented: Registering new schemas is not supported"),
+            Err(e) => assert_eq!(e.strip_backtrace(), "This feature is not implemented: Registering new schemas is not supported"),
         };
     }
 

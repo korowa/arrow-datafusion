@@ -20,27 +20,22 @@
 use std::str::FromStr;
 use std::{any::Any, sync::Arc};
 
-use arrow::compute::SortOptions;
-use arrow::datatypes::{DataType, Field, SchemaBuilder, SchemaRef};
-use arrow_schema::Schema;
-use async_trait::async_trait;
-use dashmap::DashMap;
-use datafusion_common::{internal_err, plan_err, project_schema, SchemaExt, ToDFSchema};
-use datafusion_expr::expr::Sort;
-use datafusion_optimizer::utils::conjunction;
-use datafusion_physical_expr::{create_physical_expr, LexOrdering, PhysicalSortExpr};
-use futures::{future, stream, StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::ObjectMeta;
+use super::helpers::{expr_applicable_for_cols, pruned_partition_list, split_files};
+use super::PartitionedFile;
 
-use crate::datasource::physical_plan::{FileScanConfig, FileSinkConfig};
 use crate::datasource::{
     file_format::{
-        arrow::ArrowFormat, avro::AvroFormat, csv::CsvFormat, json::JsonFormat,
-        parquet::ParquetFormat, FileFormat,
+        arrow::ArrowFormat,
+        avro::AvroFormat,
+        csv::CsvFormat,
+        file_compression_type::{FileCompressionType, FileTypeExt},
+        json::JsonFormat,
+        parquet::ParquetFormat,
+        FileFormat,
     },
     get_statistics_with_limit,
     listing::ListingTableUrl,
+    physical_plan::{is_plan_streaming, FileScanConfig, FileSinkConfig},
     TableProvider, TableType,
 };
 use crate::logical_expr::TableProviderFilterPushDown;
@@ -51,11 +46,24 @@ use crate::{
     logical_expr::Expr,
     physical_plan::{empty::EmptyExec, ExecutionPlan, Statistics},
 };
-use datafusion_common::{FileCompressionType, FileType};
 
-use super::PartitionedFile;
+use arrow::compute::SortOptions;
+use arrow::datatypes::{DataType, Field, SchemaBuilder, SchemaRef};
+use arrow_schema::Schema;
+use datafusion_common::{
+    internal_err, plan_err, project_schema, Constraints, FileType, FileTypeWriterOptions,
+    SchemaExt, ToDFSchema,
+};
+use datafusion_execution::cache::cache_manager::FileStatisticsCache;
+use datafusion_execution::cache::cache_unit::DefaultFileStatisticsCache;
+use datafusion_expr::expr::Sort;
+use datafusion_optimizer::utils::conjunction;
+use datafusion_physical_expr::{
+    create_physical_expr, LexOrdering, PhysicalSortExpr, PhysicalSortRequirement,
+};
 
-use super::helpers::{expr_applicable_for_cols, pruned_partition_list, split_files};
+use async_trait::async_trait;
+use futures::{future, stream, StreamExt, TryStreamExt};
 
 /// Configuration for creating a [`ListingTable`]
 #[derive(Debug, Clone)]
@@ -160,7 +168,8 @@ impl ListingTableConfig {
             .table_paths
             .get(0)
             .unwrap()
-            .list_all_files(store.as_ref(), "")
+            .list_all_files(state, store.as_ref(), "")
+            .await?
             .next()
             .await
             .ok_or_else(|| DataFusionError::Internal("No files for table".into()))??;
@@ -231,6 +240,7 @@ impl FromStr for ListingTableInsertMode {
         }
     }
 }
+
 /// Options for creating a [`ListingTable`]
 #[derive(Clone, Debug)]
 pub struct ListingOptions {
@@ -269,8 +279,14 @@ pub struct ListingOptions {
     /// In order to support infinite inputs, DataFusion may adjust query
     /// plans (e.g. joins) to run the given query in full pipelining mode.
     pub infinite_source: bool,
-    ///This setting controls how inserts to this table should be handled
+    /// This setting controls how inserts to this table should be handled
     pub insert_mode: ListingTableInsertMode,
+    /// This setting when true indicates that the table is backed by a single file.
+    /// Any inserts to the table may only append to this existing file.
+    pub single_file: bool,
+    /// This setting holds file format specific options which should be used
+    /// when inserting into this table.
+    pub file_type_write_options: Option<FileTypeWriterOptions>,
 }
 
 impl ListingOptions {
@@ -290,6 +306,8 @@ impl ListingOptions {
             file_sort_order: vec![],
             infinite_source: false,
             insert_mode: ListingTableInsertMode::AppendToFile,
+            single_file: false,
+            file_type_write_options: None,
         }
     }
 
@@ -464,6 +482,21 @@ impl ListingOptions {
         self
     }
 
+    /// Configure if this table is backed by a sigle file
+    pub fn with_single_file(mut self, single_file: bool) -> Self {
+        self.single_file = single_file;
+        self
+    }
+
+    /// Configure file format specific writing options.
+    pub fn with_write_options(
+        mut self,
+        file_type_write_options: FileTypeWriterOptions,
+    ) -> Self {
+        self.file_type_write_options = Some(file_type_write_options);
+        self
+    }
+
     /// Infer the schema of the files at the given path on the provided object store.
     /// The inferred schema does not include the partitioning columns.
     ///
@@ -478,44 +511,12 @@ impl ListingOptions {
         let store = state.runtime_env().object_store(table_path)?;
 
         let files: Vec<_> = table_path
-            .list_all_files(store.as_ref(), &self.file_extension)
+            .list_all_files(state, store.as_ref(), &self.file_extension)
+            .await?
             .try_collect()
             .await?;
 
         self.format.infer_schema(state, &store, &files).await
-    }
-}
-
-/// Collected statistics for files
-/// Cache is invalided when file size or last modification has changed
-#[derive(Default)]
-struct StatisticsCache {
-    statistics: DashMap<Path, (ObjectMeta, Statistics)>,
-}
-
-impl StatisticsCache {
-    /// Get `Statistics` for file location. Returns None if file has changed or not found.
-    fn get(&self, meta: &ObjectMeta) -> Option<Statistics> {
-        self.statistics
-            .get(&meta.location)
-            .map(|s| {
-                let (saved_meta, statistics) = s.value();
-                if saved_meta.size != meta.size
-                    || saved_meta.last_modified != meta.last_modified
-                {
-                    // file has changed
-                    None
-                } else {
-                    Some(statistics.clone())
-                }
-            })
-            .unwrap_or(None)
-    }
-
-    /// Save collected file statistics
-    fn save(&self, meta: ObjectMeta, statistics: Statistics) {
-        self.statistics
-            .insert(meta.location.clone(), (meta, statistics));
     }
 }
 
@@ -592,8 +593,9 @@ pub struct ListingTable {
     table_schema: SchemaRef,
     options: ListingOptions,
     definition: Option<String>,
-    collected_statistics: StatisticsCache,
+    collected_statistics: FileStatisticsCache,
     infinite_source: bool,
+    constraints: Constraints,
 }
 
 impl ListingTable {
@@ -629,11 +631,30 @@ impl ListingTable {
             table_schema: Arc::new(builder.finish()),
             options,
             definition: None,
-            collected_statistics: Default::default(),
+            collected_statistics: Arc::new(DefaultFileStatisticsCache::default()),
             infinite_source,
+            constraints: Constraints::empty(),
         };
 
         Ok(table)
+    }
+
+    /// Assign constraints
+    pub fn with_constraints(mut self, constraints: Constraints) -> Self {
+        self.constraints = constraints;
+        self
+    }
+
+    /// Set the [`FileStatisticsCache`] used to cache parquet file statistics.
+    ///
+    /// Setting a statistics cache on the `SessionContext` can avoid refetching statistics
+    /// multiple times in the same session.
+    ///
+    /// If `None`, creates a new [`DefaultFileStatisticsCache`] scoped to this query.
+    pub fn with_cache(mut self, cache: Option<FileStatisticsCache>) -> Self {
+        self.collected_statistics =
+            cache.unwrap_or(Arc::new(DefaultFileStatisticsCache::default()));
+        self
     }
 
     /// Specify the SQL definition for this table, if any
@@ -659,27 +680,26 @@ impl ListingTable {
         for exprs in &self.options.file_sort_order {
             // Construct PhsyicalSortExpr objects from Expr objects:
             let sort_exprs = exprs
-            .iter()
-            .map(|expr| {
-                if let Expr::Sort(Sort { expr, asc, nulls_first }) = expr {
-                    if let Expr::Column(col) = expr.as_ref() {
-                        let expr = physical_plan::expressions::col(&col.name, self.table_schema.as_ref())?;
-                        Ok(PhysicalSortExpr {
-                            expr,
-                            options: SortOptions {
-                                descending: !asc,
-                                nulls_first: *nulls_first,
-                            },
-                        })
+                .iter()
+                .map(|expr| {
+                    if let Expr::Sort(Sort { expr, asc, nulls_first }) = expr {
+                        if let Expr::Column(col) = expr.as_ref() {
+                            let expr = physical_plan::expressions::col(&col.name, self.table_schema.as_ref())?;
+                            Ok(PhysicalSortExpr {
+                                expr,
+                                options: SortOptions {
+                                    descending: !asc,
+                                    nulls_first: *nulls_first,
+                                },
+                            })
+                        } else {
+                            plan_err!("Expected single column references in output_ordering, got {expr}")
+                        }
+                    } else {
+                        plan_err!("Expected Expr::Sort in output_ordering, but got {expr}")
                     }
-                    else {
-                        plan_err!("Expected single column references in output_ordering, got {expr}")
-                    }
-                } else {
-                    plan_err!("Expected Expr::Sort in output_ordering, but got {expr}")
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
+                })
+                .collect::<Result<Vec<_>>>()?;
             all_sort_orders.push(sort_exprs);
         }
         Ok(all_sort_orders)
@@ -694,6 +714,10 @@ impl TableProvider for ListingTable {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.table_schema)
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(&self.constraints)
     }
 
     fn table_type(&self) -> TableType {
@@ -834,24 +858,12 @@ impl TableProvider for ListingTable {
             );
         }
 
-        // TODO support inserts to sorted tables which preserve sort_order
-        // Inserts currently make no effort to preserve sort_order. This could lead to
-        // incorrect query results on the table after inserting incorrectly sorted data.
-        let unsorted: Vec<Vec<Expr>> = vec![];
-        if self.options.file_sort_order != unsorted {
-            return Err(
-                DataFusionError::NotImplemented(
-                    "Writing to a sorted listing table via insert into is not supported yet. \
-                    To write to this table in the meantime, register an equivalent table with \
-                    file_sort_order = vec![]".into())
-            );
-        }
-
         let table_path = &self.table_paths()[0];
         // Get the object store for the table path.
         let store = state.runtime_env().object_store(table_path)?;
 
         let file_list_stream = pruned_partition_list(
+            state,
             store.as_ref(),
             table_path,
             &[],
@@ -861,12 +873,11 @@ impl TableProvider for ListingTable {
         .await?;
 
         let file_groups = file_list_stream.try_collect::<Vec<_>>().await?;
-        let writer_mode;
         //if we are writing a single output_partition to a table backed by a single file
         //we can append to that file. Otherwise, we can write new files into the directory
         //adding new files to the listing table in order to insert to the table.
         let input_partitions = input.output_partitioning().partition_count();
-        match self.options.insert_mode {
+        let writer_mode = match self.options.insert_mode {
             ListingTableInsertMode::AppendToFile => {
                 if input_partitions > file_groups.len() {
                     return Err(DataFusionError::Plan(format!(
@@ -874,19 +885,28 @@ impl TableProvider for ListingTable {
                         file_groups.len()
                     )));
                 }
-                writer_mode =
-                    crate::datasource::file_format::write::FileWriterMode::Append;
+
+                crate::datasource::file_format::write::FileWriterMode::Append
             }
             ListingTableInsertMode::AppendNewFiles => {
-                writer_mode =
-                    crate::datasource::file_format::write::FileWriterMode::PutMultipart
+                crate::datasource::file_format::write::FileWriterMode::PutMultipart
             }
             ListingTableInsertMode::Error => {
                 return plan_err!(
                     "Invalid plan attempting write to table with TableWriteMode::Error!"
-                )
+                );
             }
-        }
+        };
+
+        let file_format = self.options().format.as_ref();
+
+        let file_type_writer_options = match &self.options().file_type_write_options {
+            Some(opt) => opt.clone(),
+            None => FileTypeWriterOptions::build_default(
+                &file_format.file_type(),
+                state.config_options(),
+            )?,
+        };
 
         // Sink related option, apart from format
         let config = FileSinkConfig {
@@ -896,14 +916,50 @@ impl TableProvider for ListingTable {
             output_schema: self.schema(),
             table_partition_cols: self.options.table_partition_cols.clone(),
             writer_mode,
-            // TODO: when listing table is known to be backed by a single file, this should be false
-            per_thread_output: true,
+            // A plan can produce finite number of rows even if it has unbounded sources, like LIMIT
+            // queries. Thus, we can check if the plan is streaming to ensure file sink input is
+            // unbounded. When `unbounded_input` flag is `true` for sink, we occasionally call `yield_now`
+            // to consume data at the input. When `unbounded_input` flag is `false` (e.g non-streaming data),
+            // all of the data at the input is sink after execution finishes. See discussion for rationale:
+            // https://github.com/apache/arrow-datafusion/pull/7610#issuecomment-1728979918
+            unbounded_input: is_plan_streaming(&input)?,
+            single_file_output: self.options.single_file,
             overwrite,
+            file_type_writer_options,
+        };
+
+        let unsorted: Vec<Vec<Expr>> = vec![];
+        let order_requirements = if self.options().file_sort_order != unsorted {
+            if matches!(
+                self.options().insert_mode,
+                ListingTableInsertMode::AppendToFile
+            ) {
+                return Err(DataFusionError::Plan(
+                    "Cannot insert into a sorted ListingTable with mode append!".into(),
+                ));
+            }
+            // Multiple sort orders in outer vec are equivalent, so we pass only the first one
+            let ordering = self
+                .try_create_output_ordering()?
+                .get(0)
+                .ok_or(DataFusionError::Internal(
+                    "Expected ListingTable to have a sort order, but none found!".into(),
+                ))?
+                .clone();
+            // Converts Vec<Vec<SortExpr>> into type required by execution plan to specify its required input ordering
+            Some(
+                ordering
+                    .into_iter()
+                    .map(PhysicalSortRequirement::from)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
         };
 
         self.options()
             .format
-            .create_writer_physical_plan(input, state, config)
+            .create_writer_physical_plan(input, state, config, order_requirements)
             .await
     }
 }
@@ -926,6 +982,7 @@ impl ListingTable {
         // list files (with partitions)
         let file_list = future::try_join_all(self.table_paths.iter().map(|table_path| {
             pruned_partition_list(
+                ctx,
                 store.as_ref(),
                 table_path,
                 filters,
@@ -938,32 +995,44 @@ impl ListingTable {
         let file_list = stream::iter(file_list).flatten();
 
         // collect the statistics if required by the config
-        let files = file_list.then(|part_file| async {
-            let part_file = part_file?;
-            let statistics = if self.options.collect_stat {
-                match self.collected_statistics.get(&part_file.object_meta) {
-                    Some(statistics) => statistics,
-                    None => {
-                        let statistics = self
-                            .options
-                            .format
-                            .infer_stats(
-                                ctx,
-                                &store,
-                                self.file_schema.clone(),
+        let files = file_list
+            .map(|part_file| async {
+                let part_file = part_file?;
+                let mut statistics_result = Statistics::default();
+                if self.options.collect_stat {
+                    let statistics_cache = self.collected_statistics.clone();
+                    match statistics_cache.get_with_extra(
+                        &part_file.object_meta.location,
+                        &part_file.object_meta,
+                    ) {
+                        Some(statistics) => {
+                            statistics_result = statistics.as_ref().clone()
+                        }
+                        None => {
+                            let statistics = self
+                                .options
+                                .format
+                                .infer_stats(
+                                    ctx,
+                                    &store,
+                                    self.file_schema.clone(),
+                                    &part_file.object_meta,
+                                )
+                                .await?;
+                            statistics_cache.put_with_extra(
+                                &part_file.object_meta.location,
+                                statistics.clone().into(),
                                 &part_file.object_meta,
-                            )
-                            .await?;
-                        self.collected_statistics
-                            .save(part_file.object_meta.clone(), statistics.clone());
-                        statistics
+                            );
+                            statistics_result = statistics;
+                        }
                     }
                 }
-            } else {
-                Statistics::default()
-            };
-            Ok((part_file, statistics)) as Result<(PartitionedFile, Statistics)>
-        });
+                Ok((part_file, statistics_result))
+                    as Result<(PartitionedFile, Statistics)>
+            })
+            .boxed()
+            .buffered(ctx.config_options().execution.meta_fetch_concurrency);
 
         let (files, statistics) =
             get_statistics_with_limit(files, self.schema(), limit).await?;
@@ -977,6 +1046,9 @@ impl ListingTable {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::fs::File;
+
     use super::*;
     use crate::datasource::{provider_as_source, MemTable};
     use crate::execution::options::ArrowReadOptions;
@@ -984,20 +1056,20 @@ mod tests {
     use crate::prelude::*;
     use crate::{
         assert_batches_eq,
-        datasource::file_format::{avro::AvroFormat, parquet::ParquetFormat},
+        datasource::file_format::{
+            avro::AvroFormat, file_compression_type::FileTypeExt, parquet::ParquetFormat,
+        },
         execution::options::ReadOptions,
         logical_expr::{col, lit},
         test::{columns, object_store::register_test_store},
     };
+
     use arrow::datatypes::{DataType, Schema};
     use arrow::record_batch::RecordBatch;
-    use chrono::DateTime;
-    use datafusion_common::assert_contains;
-    use datafusion_common::GetExt;
-    use datafusion_expr::LogicalPlanBuilder;
+    use datafusion_common::{assert_contains, GetExt, ScalarValue};
+    use datafusion_expr::{BinaryExpr, LogicalPlanBuilder, Operator};
+
     use rstest::*;
-    use std::collections::HashMap;
-    use std::fs::File;
     use tempfile::TempDir;
 
     /// It creates dummy file and checks if it can create unbounded input executors.
@@ -1135,7 +1207,6 @@ mod tests {
                         nulls_first: false,
                     },
                 }]])
-
             ),
             // ok with two columns, different options
             (
@@ -1159,9 +1230,7 @@ mod tests {
                         },
                     },
                 ]])
-
             ),
-
         ];
 
         for (file_sort_order, expected_result) in cases {
@@ -1548,41 +1617,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_statistics_cache() {
-        let meta = ObjectMeta {
-            location: Path::from("test"),
-            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
-                .unwrap()
-                .into(),
-            size: 1024,
-            e_tag: None,
-        };
-
-        let cache = StatisticsCache::default();
-        assert!(cache.get(&meta).is_none());
-
-        cache.save(meta.clone(), Statistics::default());
-        assert!(cache.get(&meta).is_some());
-
-        // file size changed
-        let mut meta2 = meta.clone();
-        meta2.size = 2048;
-        assert!(cache.get(&meta2).is_none());
-
-        // file last_modified changed
-        let mut meta2 = meta.clone();
-        meta2.last_modified = DateTime::parse_from_rfc3339("2022-09-27T22:40:00+02:00")
-            .unwrap()
-            .into();
-        assert!(cache.get(&meta2).is_none());
-
-        // different file
-        let mut meta2 = meta;
-        meta2.location = Path::from("test2");
-        assert!(cache.get(&meta2).is_none());
-    }
-
     #[tokio::test]
     async fn test_insert_into_append_to_json_file() -> Result<()> {
         helper_test_insert_into_append_to_existing_files(
@@ -1843,7 +1877,8 @@ mod tests {
         )
         .await
         .expect_err("Example should fail!");
-        assert_eq!("Error during planning: zstd compression requires specifying a level such as zstd(4)", format!("{e}"));
+        assert_eq!(e.strip_backtrace(), "Invalid or Unsupported Configuration: zstd compression requires specifying a level such as zstd(4)");
+
         Ok(())
     }
 
@@ -1892,7 +1927,7 @@ mod tests {
         let session_ctx = match session_config_map {
             Some(cfg) => {
                 let config = SessionConfig::from_string_hash_map(cfg)?;
-                SessionContext::with_config(config)
+                SessionContext::new_with_config(config)
             }
             None => SessionContext::new(),
         };
@@ -2061,10 +2096,11 @@ mod tests {
         let session_ctx = match session_config_map {
             Some(cfg) => {
                 let config = SessionConfig::from_string_hash_map(cfg)?;
-                SessionContext::with_config(config)
+                SessionContext::new_with_config(config)
             }
             None => SessionContext::new(),
         };
+        let target_partition_number = session_ctx.state().config().target_partitions();
 
         // Create a new schema with one field called "a" of type Int32
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2072,6 +2108,12 @@ mod tests {
             DataType::Int32,
             false,
         )]));
+
+        let filter_predicate = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column("column1".into())),
+            Operator::GtEq,
+            Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+        ));
 
         // Create a new batch of data to insert into the table
         let batch = RecordBatch::try_new(
@@ -2153,8 +2195,10 @@ mod tests {
         let source = provider_as_source(source_table);
         // Create a table scan logical plan to read from the source table
         let scan_plan = LogicalPlanBuilder::scan("source", source, None)?
-            .repartition(Partitioning::Hash(vec![Expr::Column("column1".into())], 6))?
+            .filter(filter_predicate)?
             .build()?;
+        // Since logical plan contains a filter, increasing parallelism is helpful.
+        // Therefore, we will have 8 partitions in the final plan.
         // Create an insert plan to insert the source data into the initial table
         let insert_into_table =
             LogicalPlanBuilder::insert_into(scan_plan, "t", &schema, false)?.build()?;
@@ -2163,7 +2207,6 @@ mod tests {
             .state()
             .create_physical_plan(&insert_into_table)
             .await?;
-
         // Execute the physical plan and collect the results
         let res = collect(plan, session_ctx.task_ctx()).await?;
         // Insert returns the number of rows written, in our case this would be 6.
@@ -2195,9 +2238,9 @@ mod tests {
         // Assert that the batches read from the file match the expected result.
         assert_batches_eq!(expected, &batches);
 
-        // Assert that 6 files were added to the table
+        // Assert that `target_partition_number` many files were added to the table.
         let num_files = tmp_dir.path().read_dir()?.count();
-        assert_eq!(num_files, 6);
+        assert_eq!(num_files, target_partition_number);
 
         // Create a physical plan from the insert plan
         let plan = session_ctx
@@ -2238,9 +2281,9 @@ mod tests {
         // Assert that the batches read from the file after the second append match the expected result.
         assert_batches_eq!(expected, &batches);
 
-        // Assert that another 6 files were added to the table
+        // Assert that another `target_partition_number` many files were added to the table.
         let num_files = tmp_dir.path().read_dir()?.count();
-        assert_eq!(num_files, 12);
+        assert_eq!(num_files, 2 * target_partition_number);
 
         // Return Ok if the function
         Ok(())
@@ -2259,7 +2302,7 @@ mod tests {
         let session_ctx = match session_config_map {
             Some(cfg) => {
                 let config = SessionConfig::from_string_hash_map(cfg)?;
-                SessionContext::with_config(config)
+                SessionContext::new_with_config(config)
             }
             None => SessionContext::new(),
         };
@@ -2281,9 +2324,9 @@ mod tests {
 
         // insert data
         session_ctx.sql("insert into foo values ('foo', 'bar', 1),('foo', 'bar', 2), ('foo', 'bar', 3)")
-           .await?
-           .collect()
-           .await?;
+            .await?
+            .collect()
+            .await?;
 
         // check count
         let batches = session_ctx

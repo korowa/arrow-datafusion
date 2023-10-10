@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::{self, datatypes::SchemaRef};
 use async_trait::async_trait;
+use datafusion_common::FileType;
 use datafusion_physical_expr::PhysicalExpr;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
@@ -88,6 +89,10 @@ impl FileFormat for AvroFormat {
         let exec = AvroExec::new(conf);
         Ok(Arc::new(exec))
     }
+
+    fn file_type(&self) -> FileType {
+        FileType::AVRO
+    }
 }
 
 #[cfg(test)]
@@ -107,7 +112,7 @@ mod tests {
     #[tokio::test]
     async fn read_small_batches() -> Result<()> {
         let config = SessionConfig::new().with_batch_size(2);
-        let session_ctx = SessionContext::with_config(config);
+        let session_ctx = SessionContext::new_with_config(config);
         let state = session_ctx.state();
         let task_ctx = state.task_ctx();
         let projection = None;

@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
 use crate::parser::{
     CopyToSource, CopyToStatement, CreateExternalTable, DFParser, DescribeTableStmt,
     ExplainStatement, LexOrdering, Statement as DFStatement,
@@ -25,13 +28,14 @@ use crate::planner::{
 use crate::utils::normalize_ident;
 
 use arrow_schema::DataType;
+use datafusion_common::file_options::StatementOptions;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::{
-    not_impl_err, unqualified_field_not_found, Column, Constraints, DFField, DFSchema,
-    DFSchemaRef, DataFusionError, ExprSchema, FileType, OwnedTableReference, Result,
+    not_impl_err, plan_err, unqualified_field_not_found, Column, Constraints, DFField,
+    DFSchema, DFSchemaRef, DataFusionError, ExprSchema, OwnedTableReference, Result,
     SchemaReference, TableReference, ToDFSchema,
 };
-use datafusion_expr::dml::CopyTo;
+use datafusion_expr::dml::{CopyOptions, CopyTo};
 use datafusion_expr::expr::Placeholder;
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas_and_ambiguity_check;
 use datafusion_expr::logical_plan::builder::project;
@@ -48,17 +52,11 @@ use datafusion_expr::{
 };
 use sqlparser::ast;
 use sqlparser::ast::{
-    Assignment, Expr as SQLExpr, Expr, Ident, ObjectName, ObjectType, Query, SchemaName,
-    SetExpr, ShowCreateObject, ShowStatementFilter, Statement, TableFactor,
-    TableWithJoins, TransactionMode, UnaryOperator, Value,
+    Assignment, ColumnDef, Expr as SQLExpr, Expr, Ident, ObjectName, ObjectType, Query,
+    SchemaName, SetExpr, ShowCreateObject, ShowStatementFilter, Statement,
+    TableConstraint, TableFactor, TableWithJoins, TransactionMode, UnaryOperator, Value,
 };
 use sqlparser::parser::ParserError::ParserError;
-
-use datafusion_common::plan_err;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
-use std::str::FromStr;
-use std::sync::Arc;
 
 fn ident_to_string(ident: &Ident) -> String {
     normalize_ident(ident.to_owned())
@@ -83,6 +81,54 @@ fn get_schema_name(schema_name: &SchemaName) -> String {
             ident_to_string(auth)
         ),
     }
+}
+
+/// Construct `TableConstraint`(s) for the given columns by iterating over
+/// `columns` and extracting individual inline constraint definitions.
+fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConstraint> {
+    let mut constraints = vec![];
+    for column in columns {
+        for ast::ColumnOptionDef { name, option } in &column.options {
+            match option {
+                ast::ColumnOption::Unique { is_primary } => {
+                    constraints.push(ast::TableConstraint::Unique {
+                        name: name.clone(),
+                        columns: vec![column.name.clone()],
+                        is_primary: *is_primary,
+                    })
+                }
+                ast::ColumnOption::ForeignKey {
+                    foreign_table,
+                    referred_columns,
+                    on_delete,
+                    on_update,
+                } => constraints.push(ast::TableConstraint::ForeignKey {
+                    name: name.clone(),
+                    columns: vec![],
+                    foreign_table: foreign_table.clone(),
+                    referred_columns: referred_columns.to_vec(),
+                    on_delete: *on_delete,
+                    on_update: *on_update,
+                }),
+                ast::ColumnOption::Check(expr) => {
+                    constraints.push(ast::TableConstraint::Check {
+                        name: name.clone(),
+                        expr: Box::new(expr.clone()),
+                    })
+                }
+                // Other options are not constraint related.
+                ast::ColumnOption::Default(_)
+                | ast::ColumnOption::Null
+                | ast::ColumnOption::NotNull
+                | ast::ColumnOption::DialectSpecific(_)
+                | ast::ColumnOption::CharacterSet(_)
+                | ast::ColumnOption::Generated { .. }
+                | ast::ColumnOption::Comment(_)
+                | ast::ColumnOption::OnUpdate(_) => {}
+            }
+        }
+    }
+    constraints
 }
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
@@ -155,18 +201,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 or_replace,
                 ..
             } if table_properties.is_empty() && with_options.is_empty() => {
-                let mut constraints = constraints;
-                for column in &columns {
-                    for option in &column.options {
-                        if let ast::ColumnOption::Unique { is_primary } = option.option {
-                            constraints.push(ast::TableConstraint::Unique {
-                                name: None,
-                                columns: vec![column.name.clone()],
-                                is_primary,
-                            })
-                        }
-                    }
-                }
+                // Merge inline constraints and existing constraints
+                let mut all_constraints = constraints;
+                let inline_constraints = calc_inline_constraints_from_columns(&columns);
+                all_constraints.extend(inline_constraints);
                 match query {
                     Some(query) => {
                         let plan = self.query_to_plan(*query, planner_context)?;
@@ -202,7 +240,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         };
 
                         let constraints = Constraints::new_from_table_constraints(
-                            &constraints,
+                            &all_constraints,
                             plan.schema(),
                         )?;
 
@@ -225,7 +263,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         };
                         let plan = LogicalPlan::EmptyRelation(plan);
                         let constraints = Constraints::new_from_table_constraints(
-                            &constraints,
+                            &all_constraints,
                             plan.schema(),
                         )?;
                         Ok(LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
@@ -577,9 +615,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
         let schema = table_source.schema();
 
+        let output_schema = DFSchema::try_from(LogicalPlan::describe_schema()).unwrap();
+
         Ok(LogicalPlan::DescribeTable(DescribeTable {
             schema,
-            dummy_schema: DFSchemaRef::new(DFSchema::empty()),
+            output_schema: Arc::new(output_schema),
         }))
     }
 
@@ -603,50 +643,29 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
         };
 
-        // convert options to lowercase strings, check for explicitly set "format" option
-        let mut options = vec![];
-        let mut explicit_format = None;
-        // default behavior is to assume the user is specifying a single file to which
-        // we should output all data regardless of input partitioning.
-        let mut per_thread_output: bool = false;
-        for (key, value) in statement.options {
-            let (k, v) = (key.to_lowercase(), value.to_string().to_lowercase());
-            // check for options important to planning
-            if k == "format" {
-                explicit_format = Some(FileType::from_str(&v)?);
-            }
-            if k == "per_thread_output" {
-                per_thread_output = match v.as_str(){
-                    "true" => true,
-                    "false" => false,
-                    _ => return Err(DataFusionError::Plan(
-                        format!("Copy to option 'per_thread_output' must be true or false, got {value}")
-                    ))
-                }
-            }
-            options.push((k, v));
-        }
-        let format = match explicit_format {
-            Some(file_format) => file_format,
-            None => {
-                // try to infer file format from file extension
-                let extension: &str = &Path::new(&statement.target)
-                    .extension()
-                    .ok_or(
-                        DataFusionError::Plan("Copy To format not explicitly set and unable to get file extension!".to_string()))?
-                    .to_str()
-                    .ok_or(DataFusionError::Plan("Copy to format not explicitly set and failed to parse file extension!".to_string()))?
-                    .to_lowercase();
+        // TODO, parse options as Vec<(String, String)> to avoid this conversion
+        let options = statement
+            .options
+            .iter()
+            .map(|(s, v)| (s.to_owned(), v.to_string()))
+            .collect::<Vec<(String, String)>>();
 
-                FileType::from_str(extension)?
-            }
-        };
+        let mut statement_options = StatementOptions::new(options);
+        let file_format = statement_options.try_infer_file_type(&statement.target)?;
+        let single_file_output =
+            statement_options.take_bool_option("single_file_output")?;
+
+        // COPY defaults to outputting a single file if not otherwise specified
+        let single_file_output = single_file_output.unwrap_or(true);
+
+        let copy_options = CopyOptions::SQLOptions(statement_options);
+
         Ok(LogicalPlan::Copy(CopyTo {
             input: Arc::new(input),
             output_url: statement.target,
-            file_format: format,
-            per_thread_output,
-            options,
+            file_format,
+            single_file_output,
+            copy_options,
         }))
     }
 
@@ -701,13 +720,20 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             order_exprs,
             unbounded,
             options,
+            constraints,
         } = statement;
 
-        if file_type != "CSV"
-            && file_type != "JSON"
+        // Merge inline constraints and existing constraints
+        let mut all_constraints = constraints;
+        let inline_constraints = calc_inline_constraints_from_columns(&columns);
+        all_constraints.extend(inline_constraints);
+
+        if (file_type == "PARQUET" || file_type == "AVRO" || file_type == "ARROW")
             && file_compression_type != CompressionTypeVariant::UNCOMPRESSED
         {
-            plan_err!("File compression type can be specified for CSV/JSON files.")?;
+            plan_err!(
+                "File compression type cannot be set for PARQUET, AVRO, or ARROW files."
+            )?;
         }
 
         let schema = self.build_schema(columns)?;
@@ -718,7 +744,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
         // External tables do not support schemas at the moment, so the name is just a table name
         let name = OwnedTableReference::bare(name);
-
+        let constraints =
+            Constraints::new_from_table_constraints(&all_constraints, &df_schema)?;
         Ok(LogicalPlan::Ddl(DdlStatement::CreateExternalTable(
             PlanCreateExternalTable {
                 schema: df_schema,
@@ -734,6 +761,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 order_exprs: ordered_exprs,
                 unbounded,
                 options,
+                constraints,
             },
         )))
     }
@@ -776,28 +804,34 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     fn show_variable_to_plan(&self, variable: &[Ident]) -> Result<LogicalPlan> {
-        let variable = object_name_to_string(&ObjectName(variable.to_vec()));
-
         if !self.has_table("information_schema", "df_settings") {
             return plan_err!(
                 "SHOW [VARIABLE] is not supported unless information_schema is enabled"
             );
         }
 
-        let variable_lower = variable.to_lowercase();
+        let verbose = variable
+            .last()
+            .map(|s| ident_to_string(s) == "verbose")
+            .unwrap_or(false);
+        let mut variable_vec = variable.to_vec();
+        let mut columns: String = "name, value".to_owned();
 
-        let query = if variable_lower == "all" {
+        if verbose {
+            columns = format!("{columns}, description");
+            variable_vec = variable_vec.split_at(variable_vec.len() - 1).0.to_vec();
+        }
+
+        let variable = object_name_to_string(&ObjectName(variable_vec));
+        let base_query = format!("SELECT {columns} FROM information_schema.df_settings");
+        let query = if variable == "all" {
             // Add an ORDER BY so the output comes out in a consistent order
-            String::from(
-                "SELECT name, setting FROM information_schema.df_settings ORDER BY name",
-            )
-        } else if variable_lower == "timezone" || variable_lower == "time.zone" {
+            format!("{base_query} ORDER BY name")
+        } else if variable == "timezone" || variable == "time.zone" {
             // we could introduce alias in OptionDefinition if this string matching thing grows
-            String::from("SELECT name, setting FROM information_schema.df_settings WHERE name = 'datafusion.execution.time_zone'")
+            format!("{base_query} WHERE name = 'datafusion.execution.time_zone'")
         } else {
-            format!(
-                "SELECT name, setting FROM information_schema.df_settings WHERE name = '{variable}'"
-            )
+            format!("{base_query} WHERE name = '{variable}'")
         };
 
         let mut rewrite = DFParser::parse_sql(&query)?;

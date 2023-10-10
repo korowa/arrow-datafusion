@@ -30,11 +30,15 @@ use crate::protobuf::{
     AnalyzedLogicalPlanType, CubeNode, EmptyMessage, GroupingSetNode, LogicalExprList,
     OptimizedLogicalPlanType, OptimizedPhysicalPlanType, PlaceholderNode, RollupNode,
 };
+
 use arrow::datatypes::{
     DataType, Field, IntervalMonthDayNanoType, IntervalUnit, Schema, SchemaRef, TimeUnit,
     UnionMode,
 };
-use datafusion_common::{Column, DFField, DFSchemaRef, OwnedTableReference, ScalarValue};
+use datafusion_common::{
+    Column, Constraint, Constraints, DFField, DFSchema, DFSchemaRef, OwnedTableReference,
+    ScalarValue,
+};
 use datafusion_expr::expr::{
     self, Alias, Between, BinaryExpr, Cast, GetFieldAccess, GetIndexedField, GroupingSet,
     InList, Like, Placeholder, ScalarFunction, ScalarUDF, Sort,
@@ -300,10 +304,10 @@ impl TryFrom<&DFField> for protobuf::DfField {
     }
 }
 
-impl TryFrom<&DFSchemaRef> for protobuf::DfSchema {
+impl TryFrom<&DFSchema> for protobuf::DfSchema {
     type Error = Error;
 
-    fn try_from(s: &DFSchemaRef) -> Result<Self, Self::Error> {
+    fn try_from(s: &DFSchema) -> Result<Self, Self::Error> {
         let columns = s
             .fields()
             .iter()
@@ -313,6 +317,14 @@ impl TryFrom<&DFSchemaRef> for protobuf::DfSchema {
             columns,
             metadata: s.metadata().clone(),
         })
+    }
+}
+
+impl TryFrom<&DFSchemaRef> for protobuf::DfSchema {
+    type Error = Error;
+
+    fn try_from(s: &DFSchemaRef) -> Result<Self, Self::Error> {
+        s.as_ref().try_into()
     }
 }
 
@@ -1073,7 +1085,7 @@ impl TryFrom<&ScalarValue> for protobuf::ScalarValue {
     fn try_from(val: &ScalarValue) -> Result<Self, Self::Error> {
         use protobuf::scalar_value::Value;
 
-        let data_type = val.get_datatype();
+        let data_type = val.data_type();
         match val {
             ScalarValue::Boolean(val) => {
                 create_proto_scalar(val.as_ref(), &data_type, |s| Value::BoolValue(*s))
@@ -1508,6 +1520,7 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::Right => Self::Right,
             BuiltinScalarFunction::Rpad => Self::Rpad,
             BuiltinScalarFunction::SplitPart => Self::SplitPart,
+            BuiltinScalarFunction::StringToArray => Self::StringToArray,
             BuiltinScalarFunction::StartsWith => Self::StartsWith,
             BuiltinScalarFunction::Strpos => Self::Strpos,
             BuiltinScalarFunction::Substr => Self::Substr,
@@ -1608,6 +1621,35 @@ impl From<JoinConstraint> for protobuf::JoinConstraint {
         match t {
             JoinConstraint::On => protobuf::JoinConstraint::On,
             JoinConstraint::Using => protobuf::JoinConstraint::Using,
+        }
+    }
+}
+
+impl From<Constraints> for protobuf::Constraints {
+    fn from(value: Constraints) -> Self {
+        let constraints = value.into_iter().map(|item| item.into()).collect();
+        protobuf::Constraints { constraints }
+    }
+}
+
+impl From<Constraint> for protobuf::Constraint {
+    fn from(value: Constraint) -> Self {
+        let res = match value {
+            Constraint::PrimaryKey(indices) => {
+                let indices = indices.into_iter().map(|item| item as u64).collect();
+                protobuf::constraint::ConstraintMode::PrimaryKey(
+                    protobuf::PrimaryKeyConstraint { indices },
+                )
+            }
+            Constraint::Unique(indices) => {
+                let indices = indices.into_iter().map(|item| item as u64).collect();
+                protobuf::constraint::ConstraintMode::PrimaryKey(
+                    protobuf::PrimaryKeyConstraint { indices },
+                )
+            }
+        };
+        protobuf::Constraint {
+            constraint_mode: Some(res),
         }
     }
 }

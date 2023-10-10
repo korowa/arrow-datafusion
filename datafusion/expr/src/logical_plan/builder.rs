@@ -17,7 +17,7 @@
 
 //! This module provides a builder for creating LogicalPlans
 
-use crate::dml::CopyTo;
+use crate::dml::{CopyOptions, CopyTo};
 use crate::expr::Alias;
 use crate::expr_rewriter::{
     coerce_plan_expr_for_schema, normalize_col,
@@ -26,7 +26,9 @@ use crate::expr_rewriter::{
 };
 use crate::type_coercion::binary::comparison_coercion;
 use crate::utils::{columnize_expr, compare_sort_expr};
-use crate::{and, binary_expr, DmlStatement, Operator, WriteOp};
+use crate::{
+    and, binary_expr, DmlStatement, Operator, TableProviderFilterPushDown, WriteOp,
+};
 use crate::{
     logical_plan::{
         Aggregate, Analyze, CrossJoin, Distinct, EmptyRelation, Explain, Filter, Join,
@@ -52,6 +54,7 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
+use std::iter::zip;
 use std::sync::Arc;
 
 /// Default table name for unnamed table
@@ -238,15 +241,15 @@ impl LogicalPlanBuilder {
         input: LogicalPlan,
         output_url: String,
         file_format: FileType,
-        per_thread_output: bool,
-        options: Vec<(String, String)>,
+        single_file_output: bool,
+        copy_options: CopyOptions,
     ) -> Result<Self> {
         Ok(Self::from(LogicalPlan::Copy(CopyTo {
             input: Arc::new(input),
             output_url,
             file_format,
-            per_thread_output,
-            options,
+            single_file_output,
+            copy_options,
         })))
     }
 
@@ -1194,39 +1197,36 @@ pub fn union(left_plan: LogicalPlan, right_plan: LogicalPlan) -> Result<LogicalP
     }
 
     // create union schema
-    let union_schema = (0..left_col_num)
-        .map(|i| {
-            let left_field = left_plan.schema().field(i);
-            let right_field = right_plan.schema().field(i);
-            let nullable = left_field.is_nullable() || right_field.is_nullable();
-            let data_type =
-                comparison_coercion(left_field.data_type(), right_field.data_type())
-                    .ok_or_else(|| {
-                        DataFusionError::Plan(format!(
-                    "UNION Column {} (type: {}) is not compatible with column {} (type: {})",
-                    right_field.name(),
-                    right_field.data_type(),
-                    left_field.name(),
-                    left_field.data_type()
-                ))
-                    })?;
-
-            Ok(DFField::new(
-                left_field.qualifier().cloned(),
+    let union_schema = zip(
+        left_plan.schema().fields().iter(),
+        right_plan.schema().fields().iter(),
+    )
+    .map(|(left_field, right_field)| {
+        let nullable = left_field.is_nullable() || right_field.is_nullable();
+        let data_type =
+            comparison_coercion(left_field.data_type(), right_field.data_type())
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                "UNION Column {} (type: {}) is not compatible with column {} (type: {})",
+                right_field.name(),
+                right_field.data_type(),
                 left_field.name(),
-                data_type,
-                nullable,
+                left_field.data_type()
             ))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .to_dfschema()?;
+                })?;
+
+        Ok(DFField::new(
+            left_field.qualifier().cloned(),
+            left_field.name(),
+            data_type,
+            nullable,
+        ))
+    })
+    .collect::<Result<Vec<_>>>()?
+    .to_dfschema()?;
 
     let inputs = vec![left_plan, right_plan]
         .into_iter()
-        .flat_map(|p| match p {
-            LogicalPlan::Union(Union { inputs, .. }) => inputs,
-            other_plan => vec![Arc::new(other_plan)],
-        })
         .map(|p| {
             let plan = coerce_plan_expr_for_schema(&p, &union_schema)?;
             match plan {
@@ -1402,6 +1402,13 @@ impl TableSource for LogicalTableSource {
     fn schema(&self) -> SchemaRef {
         self.table_schema.clone()
     }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<crate::TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
 }
 
 /// Create a [`LogicalPlan::Unnest`] plan
@@ -1521,7 +1528,7 @@ mod tests {
         let err =
             LogicalPlanBuilder::scan("", table_source(&schema), projection).unwrap_err();
         assert_eq!(
-            err.to_string(),
+            err.strip_backtrace(),
             "Error during planning: table_name cannot be empty"
         );
     }
@@ -1587,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_builder_union_combined_single_union() -> Result<()> {
+    fn plan_builder_union() -> Result<()> {
         let plan =
             table_scan(Some("employee_csv"), &employee_schema(), Some(vec![3, 4]))?;
 
@@ -1598,11 +1605,12 @@ mod tests {
             .union(plan.build()?)?
             .build()?;
 
-        // output has only one union
         let expected = "Union\
-        \n  TableScan: employee_csv projection=[state, salary]\
-        \n  TableScan: employee_csv projection=[state, salary]\
-        \n  TableScan: employee_csv projection=[state, salary]\
+        \n  Union\
+        \n    Union\
+        \n      TableScan: employee_csv projection=[state, salary]\
+        \n      TableScan: employee_csv projection=[state, salary]\
+        \n    TableScan: employee_csv projection=[state, salary]\
         \n  TableScan: employee_csv projection=[state, salary]";
 
         assert_eq!(expected, format!("{plan:?}"));
@@ -1611,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_builder_union_distinct_combined_single_union() -> Result<()> {
+    fn plan_builder_union_distinct() -> Result<()> {
         let plan =
             table_scan(Some("employee_csv"), &employee_schema(), Some(vec![3, 4]))?;
 
@@ -1650,8 +1658,8 @@ mod tests {
         let err_msg1 = plan1.clone().union(plan2.clone().build()?).unwrap_err();
         let err_msg2 = plan1.union_distinct(plan2.build()?).unwrap_err();
 
-        assert_eq!(err_msg1.to_string(), expected);
-        assert_eq!(err_msg2.to_string(), expected);
+        assert_eq!(err_msg1.strip_backtrace(), expected);
+        assert_eq!(err_msg2.strip_backtrace(), expected);
 
         Ok(())
     }
@@ -1875,7 +1883,7 @@ mod tests {
             LogicalPlanBuilder::intersect(plan1.build()?, plan2.build()?, true)
                 .unwrap_err();
 
-        assert_eq!(err_msg1.to_string(), expected);
+        assert_eq!(err_msg1.strip_backtrace(), expected);
 
         Ok(())
     }

@@ -27,7 +27,7 @@ use crate::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
 use datafusion_common::config::OptimizerOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
 use datafusion_common::{plan_err, DataFusionError};
-use datafusion_physical_expr::intervals::{check_support, is_datatype_supported};
+use datafusion_physical_expr::intervals::utils::{check_support, is_datatype_supported};
 use std::sync::Arc;
 
 /// The PipelineChecker rule rejects non-runnable query plans that use
@@ -108,7 +108,7 @@ impl TreeNode for PipelineStatePropagator {
         if !children.is_empty() {
             let new_children = children
                 .into_iter()
-                .map(|child| PipelineStatePropagator::new(child))
+                .map(PipelineStatePropagator::new)
                 .map(transform)
                 .collect::<Result<Vec<_>>>()?;
             let children_unbounded = new_children

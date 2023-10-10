@@ -189,6 +189,11 @@ async fn select_with_limit() -> Result<()> {
 }
 
 #[tokio::test]
+async fn select_without_limit() -> Result<()> {
+    roundtrip_fill_na("SELECT * FROM data OFFSET 10").await
+}
+
+#[tokio::test]
 async fn select_with_limit_offset() -> Result<()> {
     roundtrip("SELECT * FROM data LIMIT 200 OFFSET 10").await
 }
@@ -207,6 +212,23 @@ async fn aggregate_distinct_with_having() -> Result<()> {
 #[tokio::test]
 async fn aggregate_multiple_keys() -> Result<()> {
     roundtrip("SELECT a, c, avg(b) FROM data GROUP BY a, c").await
+}
+
+#[tokio::test]
+async fn aggregate_grouping_sets() -> Result<()> {
+    roundtrip(
+        "SELECT a, c, d, avg(b) FROM data GROUP BY GROUPING SETS ((a, c), (a), (d), ())",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn aggregate_grouping_rollup() -> Result<()> {
+    assert_expected_plan(
+        "SELECT a, c, e, avg(b) FROM data GROUP BY ROLLUP (a, c, e)",
+        "Aggregate: groupBy=[[GROUPING SETS ((data.a, data.c, data.e), (data.a, data.c), (data.a), ())]], aggr=[[AVG(data.b)]]\
+        \n  TableScan: data projection=[a, b, c, e]"
+    ).await
 }
 
 #[tokio::test]
@@ -704,12 +726,12 @@ async fn function_extension_info(sql: &str) -> Result<(Vec<String>, Vec<u32>)> {
 }
 
 async fn create_context() -> Result<SessionContext> {
-    let state = SessionState::with_config_rt(
+    let state = SessionState::new_with_config_rt(
         SessionConfig::default(),
         Arc::new(RuntimeEnv::default()),
     )
     .with_serializer_registry(Arc::new(MockSerializerRegistry));
-    let ctx = SessionContext::with_state(state);
+    let ctx = SessionContext::new_with_state(state);
     let mut explicit_options = CsvReadOptions::new();
     let schema = Schema::new(vec![
         Field::new("a", DataType::Int64, true),

@@ -22,7 +22,10 @@ use std::any::Any;
 use bytes::Bytes;
 use datafusion_common::not_impl_err;
 use datafusion_common::DataFusionError;
+use datafusion_common::FileType;
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::PhysicalSortRequirement;
+use datafusion_physical_plan::metrics::MetricsSet;
 use rand::distributions::Alphanumeric;
 use rand::distributions::DistString;
 use std::fmt;
@@ -50,6 +53,7 @@ use crate::physical_plan::{DisplayAs, DisplayFormatType, Statistics};
 
 use super::FileFormat;
 use super::FileScanConfig;
+use crate::datasource::file_format::file_compression_type::FileCompressionType;
 use crate::datasource::file_format::write::{
     create_writer, stateless_serialize_and_write_files, BatchSerializer, FileWriterMode,
 };
@@ -59,7 +63,6 @@ use crate::datasource::physical_plan::NdJsonExec;
 use crate::error::Result;
 use crate::execution::context::SessionState;
 use crate::physical_plan::ExecutionPlan;
-use datafusion_common::FileCompressionType;
 
 /// New line delimited JSON `FileFormat` implementation.
 #[derive(Debug)]
@@ -172,6 +175,7 @@ impl FileFormat for JsonFormat {
         input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         conf: FileSinkConfig,
+        order_requirements: Option<Vec<PhysicalSortRequirement>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if conf.overwrite {
             return not_impl_err!("Overwrites are not implemented yet for Json");
@@ -183,7 +187,16 @@ impl FileFormat for JsonFormat {
         let sink_schema = conf.output_schema().clone();
         let sink = Arc::new(JsonSink::new(conf, self.file_compression_type));
 
-        Ok(Arc::new(FileSinkExec::new(input, sink, sink_schema)) as _)
+        Ok(Arc::new(FileSinkExec::new(
+            input,
+            sink,
+            sink_schema,
+            order_requirements,
+        )) as _)
+    }
+
+    fn file_type(&self) -> FileType {
+        FileType::JSON
     }
 }
 
@@ -215,6 +228,10 @@ impl BatchSerializer for JsonSerializer {
         writer.write(&batch)?;
         //drop(writer);
         Ok(Bytes::from(self.buffer.drain(..).collect::<Vec<u8>>()))
+    }
+
+    fn duplicate(&mut self) -> Result<Box<dyn BatchSerializer>> {
+        Ok(Box::new(JsonSerializer::new()))
     }
 }
 
@@ -260,6 +277,14 @@ impl JsonSink {
 
 #[async_trait]
 impl DataSink for JsonSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
     async fn write_all(
         &self,
         data: Vec<SendableRecordBatchStream>,
@@ -271,13 +296,17 @@ impl DataSink for JsonSink {
             .runtime_env()
             .object_store(&self.config.object_store_url)?;
 
+        let writer_options = self.config.file_type_writer_options.try_into_json()?;
+
+        let compression = FileCompressionType::from(writer_options.compression);
+
         // Construct serializer and writer for each file group
         let mut serializers: Vec<Box<dyn BatchSerializer>> = vec![];
         let mut writers = vec![];
         match self.config.writer_mode {
             FileWriterMode::Append => {
-                if !self.config.per_thread_output {
-                    return not_impl_err!("per_thread_output=false is not implemented for JsonSink in Append mode");
+                if self.config.single_file_output {
+                    return Err(DataFusionError::NotImplemented("single_file_output=true is not implemented for JsonSink in Append mode".into()));
                 }
                 for file_group in &self.config.file_groups {
                     let serializer = JsonSerializer::new();
@@ -286,7 +315,7 @@ impl DataSink for JsonSink {
                     let file = file_group.clone();
                     let writer = create_writer(
                         self.config.writer_mode,
-                        self.file_compression_type,
+                        compression,
                         file.object_meta.clone().into(),
                         object_store.clone(),
                     )
@@ -300,8 +329,8 @@ impl DataSink for JsonSink {
             FileWriterMode::PutMultipart => {
                 // Currently assuming only 1 partition path (i.e. not hive-style partitioning on a column)
                 let base_path = &self.config.table_paths[0];
-                match self.config.per_thread_output {
-                    true => {
+                match self.config.single_file_output {
+                    false => {
                         // Uniquely identify this batch of files with a random string, to prevent collisions overwriting files
                         let write_id =
                             Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
@@ -319,7 +348,7 @@ impl DataSink for JsonSink {
                             };
                             let writer = create_writer(
                                 self.config.writer_mode,
-                                self.file_compression_type,
+                                compression,
                                 object_meta.into(),
                                 object_store.clone(),
                             )
@@ -327,7 +356,7 @@ impl DataSink for JsonSink {
                             writers.push(writer);
                         }
                     }
-                    false => {
+                    true => {
                         let serializer = JsonSerializer::new();
                         serializers.push(Box::new(serializer));
                         let file_path = base_path.prefix();
@@ -339,7 +368,7 @@ impl DataSink for JsonSink {
                         };
                         let writer = create_writer(
                             self.config.writer_mode,
-                            self.file_compression_type,
+                            compression,
                             object_meta.into(),
                             object_store.clone(),
                         )
@@ -354,7 +383,8 @@ impl DataSink for JsonSink {
             data,
             serializers,
             writers,
-            self.config.per_thread_output,
+            self.config.single_file_output,
+            self.config.unbounded_input,
         )
         .await
     }
@@ -375,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn read_small_batches() -> Result<()> {
         let config = SessionConfig::new().with_batch_size(2);
-        let session_ctx = SessionContext::with_config(config);
+        let session_ctx = SessionContext::new_with_config(config);
         let state = session_ctx.state();
         let task_ctx = state.task_ctx();
         let projection = None;

@@ -22,8 +22,10 @@ use datafusion::logical_expr::{
     aggregate_function, window_function::find_df_window_func, BinaryExpr,
     BuiltinScalarFunction, Case, Expr, LogicalPlan, Operator,
 };
-use datafusion::logical_expr::{expr, Cast, WindowFrameBound, WindowFrameUnits};
-use datafusion::logical_expr::{Extension, Like, LogicalPlanBuilder};
+use datafusion::logical_expr::{
+    expr, Cast, Extension, GroupingSet, Like, LogicalPlanBuilder, WindowFrameBound,
+    WindowFrameUnits,
+};
 use datafusion::prelude::JoinType;
 use datafusion::sql::TableReference;
 use datafusion::{
@@ -225,8 +227,13 @@ pub async fn from_substrait_rel(
                     from_substrait_rel(ctx, input, extensions).await?,
                 );
                 let offset = fetch.offset as usize;
-                let count = fetch.count as usize;
-                input.limit(offset, Some(count))?.build()
+                // Since protobuf can't directly distinguish `None` vs `0` `None` is encoded as `MAX`
+                let count = if fetch.count as usize == usize::MAX {
+                    None
+                } else {
+                    Some(fetch.count as usize)
+                };
+                input.limit(offset, count)?.build()
             } else {
                 not_impl_err!("Fetch without an input is not valid")
             }
@@ -251,17 +258,34 @@ pub async fn from_substrait_rel(
                 let mut group_expr = vec![];
                 let mut aggr_expr = vec![];
 
-                let groupings = match agg.groupings.len() {
-                    1 => Ok(&agg.groupings[0]),
-                    _ => not_impl_err!(
-                        "Aggregate with multiple grouping sets is not supported"
-                    ),
+                match agg.groupings.len() {
+                    1 => {
+                        for e in &agg.groupings[0].grouping_expressions {
+                            let x =
+                                from_substrait_rex(e, input.schema(), extensions).await?;
+                            group_expr.push(x.as_ref().clone());
+                        }
+                    }
+                    _ => {
+                        let mut grouping_sets = vec![];
+                        for grouping in &agg.groupings {
+                            let mut grouping_set = vec![];
+                            for e in &grouping.grouping_expressions {
+                                let x = from_substrait_rex(e, input.schema(), extensions)
+                                    .await?;
+                                grouping_set.push(x.as_ref().clone());
+                            }
+                            grouping_sets.push(grouping_set);
+                        }
+                        // Single-element grouping expression of type Expr::GroupingSet.
+                        // Note that GroupingSet::Rollup would become GroupingSet::GroupingSets, when
+                        // parsed by the producer and consumer, since Substrait does not have a type dedicated
+                        // to ROLLUP. Only vector of Groupings (grouping sets) is available.
+                        group_expr.push(Expr::GroupingSet(GroupingSet::GroupingSets(
+                            grouping_sets,
+                        )));
+                    }
                 };
-
-                for e in &groupings?.grouping_expressions {
-                    let x = from_substrait_rex(e, input.schema(), extensions).await?;
-                    group_expr.push(x.as_ref().clone());
-                }
 
                 for m in &agg.measures {
                     let filter = match &m.filter {
