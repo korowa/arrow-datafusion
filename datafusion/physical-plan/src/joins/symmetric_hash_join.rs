@@ -948,6 +948,7 @@ impl OneSideHashJoiner {
             random_state,
             &mut self.hashes_buffer,
             self.deleted_offset,
+            &mut vec![],
         )?;
         Ok(())
     }

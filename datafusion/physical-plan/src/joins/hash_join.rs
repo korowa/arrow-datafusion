@@ -674,6 +674,7 @@ async fn collect_left_input(
 
     let mut hashmap = JoinHashMap::with_capacity(num_rows);
     let mut hashes_buffer = Vec::new();
+    let mut chain_tails = vec![0];
     let mut offset = 0;
     for batch in batches.iter() {
         hashes_buffer.clear();
@@ -686,6 +687,7 @@ async fn collect_left_input(
             &random_state,
             &mut hashes_buffer,
             0,
+            &mut chain_tails,
         )?;
         offset += batch.num_rows();
     }
@@ -706,6 +708,7 @@ pub fn update_hash<T>(
     random_state: &RandomState,
     hashes_buffer: &mut Vec<u64>,
     deleted_offset: usize,
+    chain_tails: &mut Vec<usize>,
 ) -> Result<()>
 where
     T: JoinHashMapType,
@@ -721,19 +724,24 @@ where
 
     // For usual JoinHashmap, the implementation is void.
     hash_map.extend_zero(batch.num_rows());
+    chain_tails.resize(chain_tails.len() + batch.num_rows(), 0);
+
 
     // insert hashes to key of the hashmap
     let (mut_map, mut_list) = hash_map.get_mut();
     for (row, hash_value) in hash_values.iter().enumerate() {
         let item = mut_map.get_mut(*hash_value, |(hash, _)| *hash_value == *hash);
         if let Some((_, index)) = item {
-            // Already exists: add index to next array
-            let prev_index = *index;
-            // Store new value inside hashmap
-            *index = (row + offset + 1) as u64;
-            // Update chained Vec at row + offset with previous value
-            mut_list[row + offset - deleted_offset] = prev_index;
+            // Map stores head index of chain
+            let head = *index as usize;
+            // Get tail for current chain
+            let tail = chain_tails[head];
+            // Set next value for current tail
+            mut_list[tail - 1] = (row + offset + 1) as u64;
+            // Sett current row as new tail
+            chain_tails[head] = row + offset + 1;
         } else {
+            chain_tails[row + offset + 1] = row + offset + 1;
             mut_map.insert(
                 *hash_value,
                 // store the value + 1 as 0 value reserved for end of list
@@ -744,6 +752,7 @@ where
             // meaning end of list
         }
     }
+
     Ok(())
 }
 
@@ -903,7 +912,7 @@ pub fn build_equal_condition_join_indices<T: JoinHashMapType>(
     // With this approach, the lexicographic order on both the probe side and the build side is preserved.
     let hash_map = build_hashmap.get_map();
     let next_chain = build_hashmap.get_list();
-    for (row, hash_value) in hash_values.iter().enumerate().rev() {
+    for (row, hash_value) in hash_values.iter().enumerate() {
         // Get the hash and find it in the build index
 
         // For every item on the build and probe we check if it matches
@@ -936,9 +945,6 @@ pub fn build_equal_condition_join_indices<T: JoinHashMapType>(
             }
         }
     }
-    // Reversing both sets of indices
-    build_indices.as_slice_mut().reverse();
-    probe_indices.as_slice_mut().reverse();
 
     let left: UInt64Array = PrimitiveArray::new(build_indices.finish().into(), None);
     let right: UInt32Array = PrimitiveArray::new(probe_indices.finish().into(), None);
