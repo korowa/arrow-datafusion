@@ -725,20 +725,29 @@ where
     // insert hashes to key of the hashmap
     let (mut_map, mut_list) = hash_map.get_mut();
     for (row, hash_value) in hash_values.iter().enumerate() {
-        let item = mut_map.get_mut(*hash_value, |(hash, _)| *hash_value == *hash);
-        if let Some((_, index)) = item {
+        let item = mut_map.get_mut(*hash_value, |(hash, _, _)| *hash_value == *hash);
+        if let Some((_, _, tail_index)) = item {
+            // let head = *index as usize;
+            // // Get tail for current chain
+            // let tail = chain_tails[head];
+            // // Set next value for current tail
+            // mut_list[tail - 1] = (row + offset + 1) as u64;
+            // // Sett current row as new tail
+            // chain_tails[head] = row + offset + 1;
+
+
             // Already exists: add index to next array
-            let prev_index = *index;
+            let tail = *tail_index as usize;
             // Store new value inside hashmap
-            *index = (row + offset + 1) as u64;
+            *tail_index = (row + offset) as u64;
             // Update chained Vec at row + offset with previous value
-            mut_list[row + offset - deleted_offset] = prev_index;
+            mut_list[tail - deleted_offset] = (row + offset + 1) as u64;
         } else {
             mut_map.insert(
                 *hash_value,
                 // store the value + 1 as 0 value reserved for end of list
-                (*hash_value, (row + offset + 1) as u64),
-                |(hash, _)| *hash,
+                (*hash_value, (row + offset + 1) as u64, (row + offset) as u64),
+                |(hash, _, _)| *hash,
             );
             // chained list at (row + offset) is already initialized with 0
             // meaning end of list
@@ -903,14 +912,14 @@ pub fn build_equal_condition_join_indices<T: JoinHashMapType>(
     // With this approach, the lexicographic order on both the probe side and the build side is preserved.
     let hash_map = build_hashmap.get_map();
     let next_chain = build_hashmap.get_list();
-    for (row, hash_value) in hash_values.iter().enumerate().rev() {
+    for (row, hash_value) in hash_values.iter().enumerate() {
         // Get the hash and find it in the build index
 
         // For every item on the build and probe we check if it matches
         // This possibly contains rows with hash collisions,
         // So we have to check here whether rows are equal or not
-        if let Some((_, index)) =
-            hash_map.get(*hash_value, |(hash, _)| *hash_value == *hash)
+        if let Some((_, index, _)) =
+            hash_map.get(*hash_value, |(hash, _, _)| *hash_value == *hash)
         {
             let mut i = *index - 1;
             loop {
@@ -936,9 +945,6 @@ pub fn build_equal_condition_join_indices<T: JoinHashMapType>(
             }
         }
     }
-    // Reversing both sets of indices
-    build_indices.as_slice_mut().reverse();
-    probe_indices.as_slice_mut().reverse();
 
     let left: UInt64Array = PrimitiveArray::new(build_indices.finish().into(), None);
     let right: UInt32Array = PrimitiveArray::new(probe_indices.finish().into(), None);
@@ -2508,8 +2514,8 @@ mod tests {
             create_hashes(&[left.columns()[0].clone()], &random_state, hashes_buff)?;
 
         // Create hash collisions (same hashes)
-        hashmap_left.insert(hashes[0], (hashes[0], 1), |(h, _)| *h);
-        hashmap_left.insert(hashes[1], (hashes[1], 1), |(h, _)| *h);
+        hashmap_left.insert(hashes[0], (hashes[0], 1, 1), |(h, _, _)| *h);
+        hashmap_left.insert(hashes[1], (hashes[1], 1, 1), |(h, _, _)| *h);
 
         let next = vec![2, 0];
 

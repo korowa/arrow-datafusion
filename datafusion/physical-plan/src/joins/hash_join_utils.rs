@@ -103,7 +103,7 @@ use hashbrown::HashSet;
 /// ```
 pub struct JoinHashMap {
     // Stores hash value to last row index
-    pub map: RawTable<(u64, u64)>,
+    pub map: RawTable<(u64, u64, u64)>,
     // Stores indices in chained list data structure
     pub next: Vec<u64>,
 }
@@ -124,9 +124,9 @@ pub trait JoinHashMapType {
     /// Extend with zero
     fn extend_zero(&mut self, len: usize);
     /// Returns mutable references to the hash map and the next.
-    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64)>, &mut Self::NextType);
+    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64, u64)>, &mut Self::NextType);
     /// Returns a reference to the hash map.
-    fn get_map(&self) -> &RawTable<(u64, u64)>;
+    fn get_map(&self) -> &RawTable<(u64, u64, u64)>;
     /// Returns a reference to the next.
     fn get_list(&self) -> &Self::NextType;
 }
@@ -139,12 +139,12 @@ impl JoinHashMapType for JoinHashMap {
     fn extend_zero(&mut self, _: usize) {}
 
     /// Get mutable references to the hash map and the next.
-    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64)>, &mut Self::NextType) {
+    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64, u64)>, &mut Self::NextType) {
         (&mut self.map, &mut self.next)
     }
 
     /// Get a reference to the hash map.
-    fn get_map(&self) -> &RawTable<(u64, u64)> {
+    fn get_map(&self) -> &RawTable<(u64, u64, u64)> {
         &self.map
     }
 
@@ -164,12 +164,12 @@ impl JoinHashMapType for PruningJoinHashMap {
     }
 
     /// Get mutable references to the hash map and the next.
-    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64)>, &mut Self::NextType) {
+    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64, u64)>, &mut Self::NextType) {
         (&mut self.map, &mut self.next)
     }
 
     /// Get a reference to the hash map.
-    fn get_map(&self) -> &RawTable<(u64, u64)> {
+    fn get_map(&self) -> &RawTable<(u64, u64, u64)> {
         &self.map
     }
 
@@ -222,7 +222,7 @@ impl fmt::Debug for JoinHashMap {
 /// ```
 pub struct PruningJoinHashMap {
     /// Stores hash value to last row index
-    pub map: RawTable<(u64, u64)>,
+    pub map: RawTable<(u64, u64, u64)>,
     /// Stores indices in chained list data structure
     pub next: VecDeque<u64>,
 }
@@ -262,7 +262,7 @@ impl PruningJoinHashMap {
         if capacity > scale_factor * self.map.len() {
             let new_capacity = (capacity * (scale_factor - 1)) / scale_factor;
             // Resize the map with the new capacity.
-            self.map.shrink_to(new_capacity, |(hash, _)| *hash)
+            self.map.shrink_to(new_capacity, |(hash, _, _)| *hash)
         }
     }
 
@@ -298,7 +298,7 @@ impl PruningJoinHashMap {
             self.map
                 .iter()
                 .map(|bucket| bucket.as_ref())
-                .filter_map(|(hash, tail_index)| {
+                .filter_map(|(hash, tail_index, _)| {
                     (*tail_index < prune_length as u64 + deleting_offset).then_some(*hash)
                 })
                 .collect::<Vec<_>>()
@@ -307,7 +307,7 @@ impl PruningJoinHashMap {
         // Remove the keys from the map.
         removable_keys.into_iter().for_each(|hash_value| {
             self.map
-                .remove_entry(hash_value, |(hash, _)| hash_value == *hash);
+                .remove_entry(hash_value, |(hash, _, _)| hash_value == *hash);
         });
 
         // Shrink the map if necessary.
@@ -1091,8 +1091,8 @@ pub mod tests {
         for hash_value in 0..data_size {
             join_hash_map.map.insert(
                 hash_value,
-                (hash_value, hash_value),
-                |(hash, _)| *hash,
+                (hash_value, hash_value, hash_value),
+                |(hash, _, _)| *hash,
             );
         }
 
@@ -1103,7 +1103,7 @@ pub mod tests {
         for hash_value in 0..deleted_part {
             join_hash_map
                 .map
-                .remove_entry(hash_value, |(hash, _)| hash_value == *hash);
+                .remove_entry(hash_value, |(hash, _, _)| hash_value == *hash);
         }
 
         assert_eq!(join_hash_map.map.len(), (data_size - deleted_part) as usize);
