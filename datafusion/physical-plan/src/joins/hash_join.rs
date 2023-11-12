@@ -726,22 +726,26 @@ where
     hash_map.extend_zero(batch.num_rows());
     chain_tails.resize(chain_tails.len() + batch.num_rows(), 0);
 
-
     // insert hashes to key of the hashmap
     let (mut_map, mut_list) = hash_map.get_mut();
+
     for (row, hash_value) in hash_values.iter().enumerate() {
         let item = mut_map.get_mut(*hash_value, |(hash, _)| *hash_value == *hash);
         if let Some((_, index)) = item {
-            // Map stores head index of chain
+            // Get saved tail for current chain
             let head = *index as usize;
-            // Get tail for current chain
-            let tail = chain_tails[head];
+            let tail_idx = chain_tails.get_mut(head).unwrap();
+            let tail = if *tail_idx == 0 {
+                head
+            } else {
+                *tail_idx
+            };
+            
             // Set next value for current tail
             mut_list[tail - 1] = (row + offset + 1) as u64;
-            // Sett current row as new tail
-            chain_tails[head] = row + offset + 1;
+            // Update tail
+            *tail_idx = row + offset + 1;
         } else {
-            chain_tails[row + offset + 1] = row + offset + 1;
             mut_map.insert(
                 *hash_value,
                 // store the value + 1 as 0 value reserved for end of list
