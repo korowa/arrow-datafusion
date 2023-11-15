@@ -739,6 +739,58 @@ pub fn record_visited_indices<T: ArrowPrimitiveType>(
     }
 }
 
+struct IndexedBuildData {
+    data: Vec<Option<u64>>,
+    offset: u64,
+}
+
+pub fn switch_to_indexed(schema: SchemaRef, batch: &RecordBatch, columns: Vec<Column>) -> Option<IndexedBuildData> {
+    let threshold = 10000 as usize;
+
+    if batch.num_rows() > threshold || batch.num_rows() == 0 || columns.len() != 1 {
+        return None
+    }
+
+    let key_idx = columns[0].index();
+
+    let key = schema.field(key_idx);
+    let array = match key.data_type() {
+        DataType::Int64 => batch.column(key_idx),
+        _ => return None,
+    };
+
+    if array.null_count() != 0 {
+        return None
+    }
+
+    let min_value  = compute::min(array.as_primitive::<Int64Type>()).unwrap();
+    let max_value = compute::max(array.as_primitive::<Int64Type>()).unwrap();
+    let value_offset = min_value;
+    if (max_value - min_value) as usize > threshold {
+        return None
+    }
+
+    let mut data: Vec<Option<u64>> = vec![None; (max_value - min_value) as usize + 1];
+
+    for (idx, v) in compute::unary::<_, _, Int64Type>(array.as_primitive::<Int64Type>(), |v| v - min_value).into_iter().enumerate() {
+        match v {
+            Some(v) => {
+                let v = v as usize;
+                if data[v].is_some() {
+                    return None
+                }
+                data[v] = Some(idx as u64);
+            },
+            None => ()
+        }
+    };
+
+    Some(IndexedBuildData {
+        indexed_data,
+        value_offset
+    })
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
