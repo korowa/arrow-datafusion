@@ -141,6 +141,8 @@ impl ListingSchemaProvider {
                             file_type: self.format.clone(),
                             has_header: self.has_header,
                             delimiter: ',',
+                            quote: '"',
+                            escape: None,
                             table_partition_cols: vec![],
                             if_not_exists: false,
                             definition: None,

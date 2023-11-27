@@ -183,6 +183,10 @@ pub struct CreateExternalTable {
     pub has_header: bool,
     /// User defined delimiter for CSVs
     pub delimiter: char,
+    /// User defined quote character for CSV
+    pub quote: char,
+    /// User defined escape character for CSV
+    pub escape: Option<char>,
     /// Path to file
     pub location: String,
     /// Partition Columns
@@ -639,6 +643,8 @@ impl<'a> DFParser<'a> {
             location: Option<String>,
             has_header: Option<bool>,
             delimiter: Option<char>,
+            quote: Option<char>,
+            escape: Option<char>,
             file_compression_type: Option<CompressionTypeVariant>,
             table_partition_cols: Option<Vec<String>>,
             order_exprs: Vec<LexOrdering>,
@@ -661,6 +667,8 @@ impl<'a> DFParser<'a> {
                 Keyword::LOCATION,
                 Keyword::WITH,
                 Keyword::DELIMITER,
+                Keyword::ESCAPE,
+                Keyword::QUOTE,
                 Keyword::COMPRESSION,
                 Keyword::PARTITIONED,
                 Keyword::OPTIONS,
@@ -687,7 +695,15 @@ impl<'a> DFParser<'a> {
                     }
                     Keyword::DELIMITER => {
                         ensure_not_set(&builder.delimiter, "DELIMITER")?;
-                        builder.delimiter = Some(self.parse_delimiter()?);
+                        builder.delimiter = Some(self.parse_char()?);
+                    }
+                    Keyword::QUOTE => {
+                        ensure_not_set(&builder.quote, "QUOTE")?;
+                        builder.quote = Some(self.parse_char()?);
+                    }
+                    Keyword::ESCAPE => {
+                        ensure_not_set(&builder.escape, "ESCAPE")?;
+                        builder.escape = Some(self.parse_char()?);
                     }
                     Keyword::COMPRESSION => {
                         self.parser.expect_keyword(Keyword::TYPE)?;
@@ -741,6 +757,8 @@ impl<'a> DFParser<'a> {
             file_type: builder.file_type.unwrap(),
             has_header: builder.has_header.unwrap_or(false),
             delimiter: builder.delimiter.unwrap_or(','),
+            quote: builder.quote.unwrap_or('"'),
+            escape: builder.escape,
             location: builder.location.unwrap(),
             table_partition_cols: builder.table_partition_cols.unwrap_or(vec![]),
             order_exprs: builder.order_exprs,
@@ -825,12 +843,12 @@ impl<'a> DFParser<'a> {
         Ok(options)
     }
 
-    fn parse_delimiter(&mut self) -> Result<char, ParserError> {
+    fn parse_char(&mut self) -> Result<char, ParserError> {
         let token = self.parser.parse_literal_string()?;
         match token.len() {
             1 => Ok(token.chars().next().unwrap()),
             _ => Err(ParserError::TokenizerError(
-                "Delimiter must be a single char".to_string(),
+                "Expected single char".to_string(),
             )),
         }
     }
@@ -895,6 +913,8 @@ mod tests {
             file_type: "CSV".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.csv".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -914,6 +934,8 @@ mod tests {
             file_type: "CSV".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.csv".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -934,6 +956,8 @@ mod tests {
             file_type: "CSV".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.csv".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -954,6 +978,8 @@ mod tests {
             file_type: "CSV".to_string(),
             has_header: false,
             delimiter: '|',
+            quote: '"',
+            escape: None,
             location: "foo.csv".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -974,6 +1000,8 @@ mod tests {
             file_type: "CSV".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.csv".into(),
             table_partition_cols: vec!["p1".to_string(), "p2".to_string()],
             order_exprs: vec![],
@@ -997,6 +1025,8 @@ mod tests {
                 file_type: "CSV".to_string(),
                 has_header: true,
                 delimiter: ',',
+                quote: '"',
+                escape: None,
                 location: "foo.csv".into(),
                 table_partition_cols: vec![],
                 order_exprs: vec![],
@@ -1023,6 +1053,8 @@ mod tests {
                 file_type: "CSV".to_string(),
                 has_header: false,
                 delimiter: ',',
+                quote: '"',
+                escape: None,
                 location: "foo.csv".into(),
                 table_partition_cols: vec![],
                 order_exprs: vec![],
@@ -1045,6 +1077,8 @@ mod tests {
             file_type: "PARQUET".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.parquet".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -1064,6 +1098,8 @@ mod tests {
             file_type: "PARQUET".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.parquet".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -1083,6 +1119,8 @@ mod tests {
             file_type: "AVRO".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.avro".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -1103,6 +1141,8 @@ mod tests {
             file_type: "PARQUET".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.parquet".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -1128,6 +1168,8 @@ mod tests {
             file_type: "X".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "blahblah".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -1148,6 +1190,8 @@ mod tests {
             file_type: "X".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "blahblah".into(),
             table_partition_cols: vec![],
             order_exprs: vec![],
@@ -1190,6 +1234,8 @@ mod tests {
                 file_type: "CSV".to_string(),
                 has_header: false,
                 delimiter: ',',
+                quote: '"',
+                escape: None,
                 location: "foo.csv".into(),
                 table_partition_cols: vec![],
                 order_exprs: vec![vec![OrderByExpr {
@@ -1221,6 +1267,8 @@ mod tests {
             file_type: "CSV".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.csv".into(),
             table_partition_cols: vec![],
             order_exprs: vec![vec![
@@ -1261,6 +1309,8 @@ mod tests {
             file_type: "CSV".to_string(),
             has_header: false,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             location: "foo.csv".into(),
             table_partition_cols: vec![],
             order_exprs: vec![vec![OrderByExpr {
@@ -1307,6 +1357,8 @@ mod tests {
             file_type: "PARQUET".to_string(),
             has_header: true,
             delimiter: '*',
+            quote: '"',
+            escape: None,
             location: "foo.parquet".into(),
             table_partition_cols: vec!["c1".into()],
             order_exprs: vec![vec![OrderByExpr {

@@ -4026,6 +4026,12 @@ impl serde::Serialize for CreateExternalTableNode {
         if self.constraints.is_some() {
             len += 1;
         }
+        if !self.quote.is_empty() {
+            len += 1;
+        }
+        if !self.escape.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.CreateExternalTableNode", len)?;
         if let Some(v) = self.name.as_ref() {
             struct_ser.serialize_field("name", v)?;
@@ -4069,6 +4075,12 @@ impl serde::Serialize for CreateExternalTableNode {
         if let Some(v) = self.constraints.as_ref() {
             struct_ser.serialize_field("constraints", v)?;
         }
+        if !self.quote.is_empty() {
+            struct_ser.serialize_field("quote", &self.quote)?;
+        }
+        if !self.escape.is_empty() {
+            struct_ser.serialize_field("escape", &self.escape)?;
+        }
         struct_ser.end()
     }
 }
@@ -4099,6 +4111,8 @@ impl<'de> serde::Deserialize<'de> for CreateExternalTableNode {
             "unbounded",
             "options",
             "constraints",
+            "quote",
+            "escape",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -4117,6 +4131,8 @@ impl<'de> serde::Deserialize<'de> for CreateExternalTableNode {
             Unbounded,
             Options,
             Constraints,
+            Quote,
+            Escape,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -4152,6 +4168,8 @@ impl<'de> serde::Deserialize<'de> for CreateExternalTableNode {
                             "unbounded" => Ok(GeneratedField::Unbounded),
                             "options" => Ok(GeneratedField::Options),
                             "constraints" => Ok(GeneratedField::Constraints),
+                            "quote" => Ok(GeneratedField::Quote),
+                            "escape" => Ok(GeneratedField::Escape),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -4185,6 +4203,8 @@ impl<'de> serde::Deserialize<'de> for CreateExternalTableNode {
                 let mut unbounded__ = None;
                 let mut options__ = None;
                 let mut constraints__ = None;
+                let mut quote__ = None;
+                let mut escape__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -4273,6 +4293,18 @@ impl<'de> serde::Deserialize<'de> for CreateExternalTableNode {
                             }
                             constraints__ = map_.next_value()?;
                         }
+                        GeneratedField::Quote => {
+                            if quote__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("quote"));
+                            }
+                            quote__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Escape => {
+                            if escape__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("escape"));
+                            }
+                            escape__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(CreateExternalTableNode {
@@ -4290,6 +4322,8 @@ impl<'de> serde::Deserialize<'de> for CreateExternalTableNode {
                     unbounded: unbounded__.unwrap_or_default(),
                     options: options__.unwrap_or_default(),
                     constraints: constraints__,
+                    quote: quote__.unwrap_or_default(),
+                    escape: escape__.unwrap_or_default(),
                 })
             }
         }

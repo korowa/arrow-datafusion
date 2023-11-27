@@ -71,6 +71,8 @@ impl TableProviderFactory for ListingTableFactory {
                 CsvFormat::default()
                     .with_has_header(cmd.has_header)
                     .with_delimiter(cmd.delimiter as u8)
+                    .with_quote(cmd.quote as u8)
+                    .with_escape(cmd.escape.map(|c| c as u8))
                     .with_file_compression_type(file_compression_type),
             ),
             #[cfg(feature = "parquet")]
@@ -262,6 +264,8 @@ mod tests {
             file_type: "csv".to_string(),
             has_header: true,
             delimiter: ',',
+            quote: '"',
+            escape: None,
             schema: Arc::new(DFSchema::empty()),
             table_partition_cols: vec![],
             if_not_exists: false,

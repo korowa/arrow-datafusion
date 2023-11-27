@@ -216,6 +216,8 @@ message CreateExternalTableNode {
   bool unbounded = 14;
   map<string, string> options = 11;
   Constraints constraints = 15;
+  string quote = 16;
+  string escape = 17;
 }
 
 message PrepareNode {

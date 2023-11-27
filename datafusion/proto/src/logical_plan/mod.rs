@@ -505,6 +505,13 @@ impl AsLogicalPlan for LogicalPlanNode {
                 } else {
                     None
                 };
+                let escape = if !create_extern_table.escape.is_empty() {
+                    Some(create_extern_table.delimiter.chars().next().ok_or_else(|| {
+                        DataFusionError::Internal(String::from("Protobuf deserialization error, unable to parse CSV escape"))
+                    })?)
+                } else {
+                    None
+                };
 
                 let file_type = create_extern_table.file_type.as_str();
                 if ctx.table_factory(file_type).is_none() {
@@ -530,6 +537,10 @@ impl AsLogicalPlan for LogicalPlanNode {
                     delimiter: create_extern_table.delimiter.chars().next().ok_or_else(|| {
                         DataFusionError::Internal(String::from("Protobuf deserialization error, unable to parse CSV delimiter"))
                     })?,
+                    quote: create_extern_table.quote.chars().next().ok_or_else(|| {
+                        DataFusionError::Internal(String::from("Protobuf deserialization error, unable to parse CSV quote"))
+                    })?,
+                    escape,
                     table_partition_cols: create_extern_table
                         .table_partition_cols
                         .clone(),
@@ -1289,6 +1300,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                     file_type,
                     has_header,
                     delimiter,
+                    quote,
+                    escape,
                     schema: df_schema,
                     table_partition_cols,
                     if_not_exists,
@@ -1323,6 +1336,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                             table_partition_cols: table_partition_cols.clone(),
                             if_not_exists: *if_not_exists,
                             delimiter: String::from(*delimiter),
+                            quote: String::from(*quote),
+                            escape: escape.clone().unwrap_or_default().to_string(),
                             order_exprs: converted_order_exprs,
                             definition: definition.clone().unwrap_or_default(),
                             file_compression_type: file_compression_type.to_string(),
