@@ -125,8 +125,6 @@ async fn test_left_join_1k() {
 }
 
 #[tokio::test]
-// flaky for HjSmj case
-// https://github.com/apache/datafusion/issues/12359
 async fn test_left_join_1k_filtered() {
     JoinFuzzTestCase::new(
         make_staggered_batches(1000),
@@ -134,7 +132,7 @@ async fn test_left_join_1k_filtered() {
         JoinType::Left,
         Some(Box::new(col_lt_col_filter)),
     )
-    .run_test(&[JoinTestType::NljHj], false)
+    .run_test(&[JoinTestType::HjSmj, JoinTestType::NljHj], false)
     .await
 }
 
@@ -151,8 +149,6 @@ async fn test_right_join_1k() {
 }
 
 #[tokio::test]
-// flaky for HjSmj case
-// https://github.com/apache/datafusion/issues/12359
 async fn test_right_join_1k_filtered() {
     JoinFuzzTestCase::new(
         make_staggered_batches(1000),
@@ -160,7 +156,7 @@ async fn test_right_join_1k_filtered() {
         JoinType::Right,
         Some(Box::new(col_lt_col_filter)),
     )
-    .run_test(&[JoinTestType::NljHj], false)
+    .run_test(&[JoinTestType::HjSmj, JoinTestType::NljHj], false)
     .await
 }
 
@@ -177,8 +173,6 @@ async fn test_full_join_1k() {
 }
 
 #[tokio::test]
-// flaky for HjSmj case
-// https://github.com/apache/datafusion/issues/12359
 async fn test_full_join_1k_filtered() {
     JoinFuzzTestCase::new(
         make_staggered_batches(1000),
@@ -186,7 +180,7 @@ async fn test_full_join_1k_filtered() {
         JoinType::Full,
         Some(Box::new(col_lt_col_filter)),
     )
-    .run_test(&[JoinTestType::NljHj], false)
+    .run_test(&[JoinTestType::HjSmj, JoinTestType::NljHj], false)
     .await
 }
 
@@ -227,8 +221,6 @@ async fn test_anti_join_1k() {
 }
 
 #[tokio::test]
-// flaky for HjSmj case, giving 1 rows difference sometimes
-// https://github.com/apache/datafusion/issues/11555
 async fn test_anti_join_1k_filtered() {
     JoinFuzzTestCase::new(
         make_staggered_batches(1000),
@@ -236,7 +228,7 @@ async fn test_anti_join_1k_filtered() {
         JoinType::LeftAnti,
         Some(Box::new(col_lt_col_filter)),
     )
-    .run_test(&[JoinTestType::NljHj], false)
+    .run_test(&[JoinTestType::HjSmj, JoinTestType::NljHj], false)
     .await
 }
 
